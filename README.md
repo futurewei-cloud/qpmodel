@@ -15,7 +15,7 @@ The optimizer exercise following constructs:
 	SQLContext sqlContext = new SQLContext();
 
 	// leverage c#'s sqrt so we don't have to write our own
-	string sqroot(double d) => Math.Sqrt(d).ToString("#.###");
+	double sqroot(double d) => Math.Sqrt(d);
 	SQLContext.Register<double, string>("sqroot", sqroot);
 
 	// use sqroot in SQL
