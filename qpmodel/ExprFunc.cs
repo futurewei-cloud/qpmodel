@@ -33,6 +33,7 @@ using System.Diagnostics;
 using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.utils;
+using qpmodel.stream;
 
 using Value = System.Object;
 
@@ -78,6 +79,7 @@ namespace qpmodel.expr
     {
         internal string funcName_;
         internal int argcnt_;
+        internal bool isSRF_ = false; // set returning function
 
         internal Expr arg_() { Debug.Assert(argcnt_ == 1); return args_()[0]; }
         internal List<Expr> args_() => children_;
@@ -128,8 +130,15 @@ namespace qpmodel.expr
                 case "upper": r = new UpperFunc(args); break;
                 case "year": r = new YearFunc(args); break;
                 case "repeat": r = new RepeatFunc(args); break;
+                case "abs": r = new AbsFunc(args); break;
                 case "round": r = new RoundFunc(args); break;
                 case "coalesce": r = new CoalesceFunc(args); break;
+                case "hash": r = new HashFunc(args); break;
+                case "tumble": r = new TumbleWindow(args); break;
+                case "tumble_start": r = new TumbleStart(args); break;
+                case "tumble_end": r = new TumbleEnd(args); break;
+                case "hop": r = new HopWindow(args); break;
+                case "session": r = new SessionWindow(args); break;
                 default:
                     if (ExternalFunctions.set_.ContainsKey(funcName))
                         r = new ExternalFunc(func, args);
@@ -281,7 +290,39 @@ namespace qpmodel.expr
 
             if (number is null)
                 return null;
-            return Math.Round(number, decimals);
+
+            // there are multiple Math.Round(), an integer number confuses them
+            var type = args_()[0].type_;
+            if (type is IntType)
+                return Math.Round((decimal)number, decimals);
+            else
+                return Math.Round((double)number, decimals);
+        }
+    }
+
+    public class AbsFunc : FuncExpr
+    {
+        public AbsFunc(List<Expr> args) : base("abs", args)
+        {
+            argcnt_ = 1;
+        }
+
+        public override void Bind(BindContext context)
+        {
+            base.Bind(context);
+            type_ = args_()[0].type_;
+        }
+
+        public override Value Exec(ExecContext context, Row input)
+        {
+            dynamic number = args_()[0].Exec(context, input);
+
+            // there are multiple Math.Abs(), an integer number confuses them
+            var type = args_()[0].type_;
+            if (type is IntType)
+                return Math.Abs((decimal)number);
+            else
+                return Math.Abs((double)number);
         }
     }
 
@@ -333,6 +374,20 @@ namespace qpmodel.expr
         }
     }
 
+    public class HashFunc: FuncExpr
+    {
+        public HashFunc(List<Expr> args) : base("hash", args)
+        {
+            argcnt_ = 1;
+            type_ = new IntType();
+        }
+        public override Value Exec(ExecContext context, Row input)
+        {
+            dynamic val = arg_();
+            int hashval = val.GetHashCode();
+            return hashval;
+        }
+    }
 
     public abstract class AggFunc : FuncExpr
     {

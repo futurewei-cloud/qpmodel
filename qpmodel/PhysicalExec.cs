@@ -29,8 +29,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
 using System.Diagnostics;
+using System.Collections.Concurrent;
 
 using qpmodel.expr;
 using qpmodel.logic;
@@ -193,6 +194,155 @@ namespace qpmodel.physic
             if (results_.ContainsKey(ctename))
                 return results_[ctename];
             return null;
+        }
+    }
+
+    // Distributed context is an extension of regular execution context
+    // for distributed queries. Only remote exchange operators and scan
+    // shall be aware of it.
+    //
+    public class DistributedContext : ExecContext
+    {
+        public MachinePool machines_ { get; set; } = new MachinePool();
+
+        // which machine this query fragment is executed
+        public int machineId_ { get; set; } = -1;
+
+        public DistributedContext(QueryOption option) : base(option) { }
+    }
+
+    // Emulate a remote exchange channel
+    //   So we say send/recv
+    //
+    public class ExchangeChannel
+    {
+        BlockingCollection<Row> dataBuffer_ = new BlockingCollection<Row>();
+        int cntDoneProducers_ = 0;
+        int cntProducers_;
+
+        public ExchangeChannel(int dop){
+            cntDoneProducers_ = 0;
+            cntProducers_ = dop;
+        }
+
+        public void Send(Row r)
+        {
+            dataBuffer_.Add(r);
+        }
+
+        public void MarkSendDone(int workerid)
+        {
+            var newcnt = Interlocked.Increment(ref cntDoneProducers_);
+            Debug.Assert(newcnt <= cntProducers_);
+            if (newcnt == cntProducers_)
+                dataBuffer_.CompleteAdding();
+        }
+
+        public Row Recv()
+        {
+            Row r = null;
+            if (!dataBuffer_.IsCompleted)
+            {
+                try
+                {
+                    r = dataBuffer_.Take();
+                    Debug.Assert(r != null);
+                }
+                catch (InvalidOperationException)
+                {
+                    // no row in the buffer
+                }
+            }
+            return r;
+        }
+    }
+
+    public class MachinePool
+    {
+        public class ChannelId
+        {
+            internal string planId_;
+            internal int machineId_;
+
+            public ChannelId(string planId, int machineId)
+            {
+                planId_ = planId;
+                machineId_ = machineId;
+            }
+
+            public override int GetHashCode() => ToString().GetHashCode();
+            public override bool Equals(object obj)
+            {
+                if (obj is ChannelId co)
+                    return co.planId_.Equals(planId_) && co.machineId_.Equals(machineId_);
+                return false;
+            }
+            public override string ToString() => $"{planId_}.{machineId_}";
+        }
+
+        internal ConcurrentDictionary<ChannelId, ExchangeChannel> channels_ = new ConcurrentDictionary<ChannelId, ExchangeChannel>();
+        public MachinePool() {}
+
+        public void RegisterChannel(string planId, int machineId, ExchangeChannel channel)
+        {
+            bool result = channels_.TryAdd(new ChannelId(planId, machineId), channel);
+            if (result != true)
+                throw new InvalidProgramException("no conflicts shall expected");
+        }
+
+        public ExchangeChannel WaitForChannelReady(string plandId, int machineId)
+        {
+            restart:
+            var channelId = new MachinePool.ChannelId(plandId, machineId);
+            if (channels_.TryGetValue(channelId, out ExchangeChannel channel))
+                return channel;
+            else 
+            {
+                // wait for its ready - a manual event is better
+                Thread.Sleep(100);
+                goto restart;
+            }
+        }
+    }
+
+    // A worker object consists data structures used by a worker thread
+    //
+    public class WorkerObject
+    {
+        // machineId_ + planId_ identifies a worker object
+        internal int machineId_;
+        internal string planId_;
+        internal PhysicNode root_;
+        internal MachinePool machines_;
+        internal QueryOption queryOpt_;
+
+        // debug info
+        internal string parentThread_;
+
+        public WorkerObject(string parentThread, MachinePool machines, int machineId, string planId, PhysicNode root, QueryOption queryOpt)
+        {
+            parentThread_ = parentThread;
+            machines_ = machines;
+            machineId_ = machineId;
+            planId_ = planId;
+            root_ = root;
+            queryOpt_ = queryOpt;
+        }
+
+        public void EntryPoint()
+        {
+            var context = new DistributedContext(queryOpt_);
+            context.machineId_ = machineId_;
+            context.machines_ = machines_;
+
+            // TBD: open subqueries
+
+            var plan = root_ as PhysicRemoteExchange;
+            plan.asConsumer_ = false;
+
+            var code = plan.Open(context);
+            code = plan.Exec(null);
+            code = plan.Close();
         }
     }
 }

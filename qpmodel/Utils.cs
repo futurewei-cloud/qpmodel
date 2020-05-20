@@ -45,9 +45,96 @@ namespace qpmodel.utils
         internal static int CurId() { return id_; }
     }
 
+    // A generic nary-tree node
+    //   This serves as basis for both expression and query tree node
+    //
+    public class TreeNode<T> where T : TreeNode<T>
+    {
+        // unique identifier
+        internal string _ = "uninitialized";
+
+        [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
+        public List<T> children_ = new List<T>();
+        public bool IsLeaf() => children_.Count == 0;
+
+        // shortcut for conventional names
+        public T child_() { Debug.Assert(children_.Count == 1); return children_[0]; }
+        public T l_() { Debug.Assert(children_.Count == 2); return children_[0]; }
+        public T r_() { Debug.Assert(children_.Count == 2); return children_[1]; }
+
+        public TreeNode()
+        {
+           _ = $"{ObjectID.NewId()}";
+        }
+
+        // traversal pattern FOR EACH
+        public void VisitEachT<T1>(Action<T1> callback) where T1 : T
+        {
+            if (this is T1)
+                callback(this as T1);
+            foreach (var v in children_)
+                v.VisitEachT<T1>(callback);
+        }
+        public void VisitEach(Action<T> callback)
+              => VisitEachT<T>(callback);
+
+        // FOR EACH with parent-child relationship
+        //   can also skip certain parent type and its children recursively
+        //
+        public void VisitEach(Action<T, int, T> callback, Type skipParentType = null)
+        {
+            void visitParentAndChildren(T parent,
+                        Action<T, int, T> callback, Type skipParentType = null)
+            {
+                if (parent.GetType() == skipParentType)
+                    return;
+
+                if (parent == this)
+                    callback(null, -1, (T)this);
+                for (int i = 0; i < parent.children_.Count; i++)
+                {
+                    var child = parent.children_[i];
+                    callback(parent, i, child);
+                    visitParentAndChildren(child, callback, skipParentType);
+                }
+            }
+
+            visitParentAndChildren((T)this, callback, skipParentType);
+        }
+
+        // traversal pattern EXISTS
+        //  if any visit returns a true, stop recursion. So if you want to
+        //  visit all nodes regardless, use TraverseEachNode(). 
+        // 
+        public bool VisitEachExists(Func<T, bool> callback, List<Type> excluding = null)
+        {
+            if (excluding?.Contains(GetType()) ?? false)
+                return false;
+
+            bool exists = callback((T)this);
+            if (!exists)
+            {
+                foreach (var c in children_)
+                    if (c.VisitEachExists(callback, excluding))
+                        return true;
+            }
+            return exists;
+        }
+
+        // clone
+        public virtual T Clone()
+        {
+            var n = (T)MemberwiseClone();
+            n.children_ = new List<T>();
+            children_.ForEach(x => n.children_.Add(x.Clone()));
+            Debug.Assert(Equals(n));
+            return n;
+        }
+    }
+
     public static class Utils
     {
-        internal static string Tabs(int depth) => new string(' ', depth * 2);
+        internal static string Spaces(int depth) => new string(' ', depth * 2);
 
         // this is shortcut for unhandled conditions - they shall be translated to 
         // related exceptional handling code later

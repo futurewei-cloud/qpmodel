@@ -55,7 +55,7 @@ namespace qpmodel
         public override string ToString() => $"{name_} {type_} [{ordinal_}]";
     }
 
-    public class Partition {
+    public class Distribution {
         public TableDef tableDef_;
 
         public List<Row> heap_ = new List<Row>();
@@ -66,13 +66,13 @@ namespace qpmodel
     {
         public string name_;
         public Dictionary<string, ColumnDef> columns_;
-        public ColumnDef partitionBy_;
+        public ColumnDef distributedBy_;
         public List<IndexDef> indexes_ = new List<IndexDef>();
 
-        // storage
-        public List<Partition> partions_ = new List<Partition>();
+        // emulated storage across multiple machines
+        public List<Distribution> distributions_ = new List<Distribution>();
 
-        public TableDef(string tabName, List<ColumnDef> columns, string partitionBy)
+        public TableDef(string tabName, List<ColumnDef> columns, string distributedBy)
         {
             int npart = 1;
             Dictionary<string, ColumnDef> cols = new Dictionary<string, ColumnDef>();
@@ -80,16 +80,16 @@ namespace qpmodel
                 cols.Add(c.name_, c);
             name_ = tabName; columns_ = cols;
 
-            if (partitionBy != null)
+            if (distributedBy != null)
             {
-                cols.TryGetValue(partitionBy, out var partcol);
+                cols.TryGetValue(distributedBy, out var partcol);
                 if (partcol is null)
-                    throw new SemanticAnalyzeException($"can't find partition column '{partitionBy}'");
-                partitionBy_ = partcol;
-                npart = QueryOption.num_table_partitions_;
+                    throw new SemanticAnalyzeException($"can't find distribution column '{distributedBy}'");
+                distributedBy_ = partcol;
+                npart = QueryOption.num_machines_;
             }
             for (int i = 0; i < npart; i++)
-                partions_.Add(new Partition());
+                distributions_.Add(new Distribution());
         }
 
         public List<ColumnDef> ColumnsInOrder() {
@@ -122,10 +122,10 @@ namespace qpmodel
     {
         readonly Dictionary<string, TableDef> records_ = new Dictionary<string, TableDef>();
 
-        public void CreateTable(string tabName, List<ColumnDef> columns, string partitionBy)
+        public void CreateTable(string tabName, List<ColumnDef> columns, string distributedBy)
         {
             records_.Add(tabName,
-                new TableDef(tabName, columns, partitionBy));
+                new TableDef(tabName, columns, distributedBy));
         }
         public void DropTable(string tabName)
         {
@@ -204,15 +204,20 @@ namespace qpmodel
                 @"create table d (d1 int, d2 int, d3 int, d4 int);",
                 // nullable tables
                 @"create table r (r1 int, r2 int, r3 int, r4 int);",
-                // partition tables
-                @"create table ap(a1 int, a2 int, a3 int, a4 int) partition by a1;",
+                // distributed tables
+                @"create table ad (a1 int, a2 int, a3 int, a4 int) distributed by a1;",
+                @"create table bd (b1 int, b2 int, b3 int, b4 int) distributed by b1;",
+                @"create table cd (c1 int, c2 int, c3 int, c4 int) distributed by c1;",
+                @"create table dd (d1 int, d2 int, d3 int, d4 int) distributed by d1;",
+                // steaming tables
+                @"create table ast (a0 datetime, a1 int, a2 int, a3 int, a4 int);",
             };
             SQLStatement.ExecSQLList(string.Join("", createtables));
 
             // load tables
             var curdir = Directory.GetCurrentDirectory();
             var folder = $@"{curdir}\..\..\..\data";
-            var tables = new List<string>() { "a", "b", "c", "d", "r", "ap" };
+            var tables = new List<string>() { "a", "b", "c", "d", "r", "ad", "bd", "cd", "dd", "ast"};
             foreach (var v in tables)
             {
                 string filename = $@"'{folder}\{v}.tbl'";
@@ -237,11 +242,13 @@ namespace qpmodel
 
         static Catalog()
         {
+        }
+
+        static public void Init() 
+        {
             // be careful: any exception happened here will be swallowed without throw any exception
             createBuildInTestTables();
             createOptimizerTables();
         }
-
-        static internal void Init() { }
     }
 }

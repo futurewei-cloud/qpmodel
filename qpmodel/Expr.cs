@@ -218,7 +218,7 @@ namespace qpmodel.expr
             return list.ToList();
         }
 
-        public static string PrintExprWithSubqueryExpanded(this Expr expr, int depth, ExplainOption option)
+        public static string ExplainExprWithSubqueryExpanded(this Expr expr, int depth, ExplainOption option)
         {
             string r = "";
             // append the subquery plan align with expr
@@ -228,12 +228,12 @@ namespace qpmodel.expr
                 expr.VisitEachT<SubqueryExpr>(x =>
                 {
                     string cached = x.IsCacheable() ? "cached " : "";
-                    r += Utils.Tabs(depth + 2) + $"<{x.GetType().Name}> {cached}{x.subqueryid_}\n";
+                    r += Utils.Spaces(depth + 2) + $"<{x.GetType().Name}> {cached}{x.subqueryid_}\n";
                     Debug.Assert(x.query_.bindContext_ != null);
                     if (x.query_.physicPlan_ != null)
-                        r += $"{x.query_.physicPlan_.Explain(depth + 4, option)}";
+                        r += $"{x.query_.physicPlan_.Explain(option, depth + 4)}";
                     else
-                        r += $"{x.query_.logicPlan_.Explain(depth + 4, option)}";
+                        r += $"{x.query_.logicPlan_.Explain(option, depth + 4)}";
                 });
             }
 
@@ -530,12 +530,12 @@ namespace qpmodel.expr
         }
     }
 
-    public class Expr
+    // Expr: root class of expression
+    //     subclass shall only use children_ to contain Expr, otherwise
+    //      Bind() etc won't work.
+    //
+    public class Expr: TreeNode<Expr>
     {
-        // unique identifier
-        [DebuggerBrowsable(DebuggerBrowsableState.Never)]
-        internal string _;
-
         // Expression in selection list can have an output name 
         // e.g, a.i+b.i [[as] total]
         //
@@ -548,10 +548,6 @@ namespace qpmodel.expr
         //    4. Output name can be refered by ORDER BY|GROUP BY but not WHERE|HAVING.
         //
         internal string outputName_;
-
-        // subclass shall only use children_ to contain Expr, otherwise, Bind() etc won't work
-        [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
-        internal List<Expr> children_ = new List<Expr>();
 
         // we require some columns for query processing but user may not want 
         // them in the final output, so they are marked as invisible.
@@ -574,15 +570,6 @@ namespace qpmodel.expr
         // debug info
         internal bool dbg_isCloneCopy_ = false;
 
-        public Expr() { _ = $"{ObjectID.NewId()}"; }
-
-        public bool IsLeaf() => children_.Count == 0;
-
-        // shortcut for conventional names
-        public Expr child_() { Debug.Assert(children_.Count == 1); return children_[0]; }
-        public Expr l_() { Debug.Assert(children_.Count == 2); return children_[0]; }
-        public Expr r_() { Debug.Assert(children_.Count == 2); return children_[1]; }
-
         protected string outputName() => outputName_ != null ? $"(as {outputName_})" : null;
 
         void validateAfterBound() {
@@ -594,32 +581,6 @@ namespace qpmodel.expr
         public bool EqualTableRef(TableRef tableRef){ validateAfterBound();Debug.Assert(TableRefCount() == 1);return tableRefs_[0].Equals(tableRef);}
         public bool TableRefsContainedBy(List<TableRef> tableRefs){validateAfterBound();return tableRefs.ContainsList(tableRefs_);}
 
-        bool VisitEachExistsT<T>(Func<T, bool> check, List<Type> excluding = null) where T : Expr
-        {
-            if (excluding?.Contains(GetType()) ?? false)
-                return false;
-
-            bool r = check(this as T);
-            if (!r)
-            {
-                foreach (var v in children_)
-                {
-                    if (v.VisitEachExistsT(check, excluding))
-                        return true;
-                }
-            }
-            return r;
-        }
-        public bool VisitEachExists(Func<Expr, bool> check, List<Type> excluding = null)
-            => VisitEachExistsT<Expr>(check, excluding);
-        public void VisitEachT<T>(Action<T> callback) where T : Expr
-        {
-            if (this is T)
-                callback(this as T);
-            foreach (var v in children_)
-                v.VisitEachT<T>(callback);
-        }
-        public void VisitEach(Action<Expr> callback) => VisitEachT<Expr>(callback);
         public void VisitEachIgnoreRef<T>(Action<T> callback) where T : Expr
             => VisitEachIgnore<ExprRef, T>(callback);
 
@@ -669,14 +630,13 @@ namespace qpmodel.expr
         // notice b.a2 and a.a2 are the same column but have different ordinal.
         // This means we have to copy ColExpr, so its parents, then everything.
         //
-        public Expr Clone()
+        public override Expr Clone()
         {
-            Expr n = (Expr)MemberwiseClone();
-            n.children_ = children_.CloneList();
+            var n = base.Clone();
             n.tableRefs_ = new List<TableRef>();
             tableRefs_.ForEach(n.tableRefs_.Add);
             n.dbg_isCloneCopy_ = true;
-            n._ = _;
+
             Debug.Assert(Equals(n));
             return n;
         }
@@ -820,8 +780,12 @@ namespace qpmodel.expr
             return expr;
         }
 
-        public virtual string PrintString(int depth) => ToString();
-        public virtual Value Exec(ExecContext context, Row input) => throw new Exception($"{this} subclass shall implment Exec()");
+        // Similar to physic operators, an expression shall implments an Exec interface. The
+        // difference is operator's Exec() is designed to return the code "string", while
+        // expression split into two interfaces Exec() and ExecCode() for easier usage.
+        //
+        public virtual Value Exec(ExecContext context, Row input)
+            => throw new Exception($"{this} subclass shall implment Exec()");
         public virtual string ExecCode(ExecContext context, string input) {
             return $@"ExprSearch.Locate(""{_}"").Exec(context, {input}) /*{ToString()}*/";
         }
@@ -1182,16 +1146,27 @@ namespace qpmodel.expr
 
         void convertToDateTime(int interval, string unit)
         {
+            string[] validIntevals = {"years", "months", "days", "hours", "minutes", "seconds",
+                    "year", "month", "day", "hour", "minute", "second"};
             str_ = interval + unit;
             type_ = new DateTimeType();
+            Debug.Assert(validIntevals.Contains(unit));
 
-            Debug.Assert(unit.Contains("day") || unit.Contains("month") || unit.Contains("year"));
-            int day = interval;
-            if (unit.Contains("month"))
-                day *= 30;  // FIXME
+            // convert year/month to day or hour/min to second
+            int days = 0, seconds = 0;
+            if (unit.Contains("day"))
+                days = interval;
+            else if (unit.Contains("month"))
+                days = interval * 30;  // FIXME
             else if (unit.Contains("year"))
-                day *= 365;  // FIXME
-            val_ = new TimeSpan(day, 0, 0, 0);
+                days = interval * 365;  // FIXME
+            else if (unit.Contains("second"))
+                seconds = interval;
+            else if (unit.Contains("minute"))
+                seconds = interval * 60;
+            else if (unit.Contains("hour"))
+                seconds = interval * 3600;
+            val_ = new TimeSpan(days, 0, 0, seconds);
         }
 
         public override string ToString()

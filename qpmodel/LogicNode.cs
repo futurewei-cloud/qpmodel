@@ -65,23 +65,52 @@ namespace qpmodel.logic
         // it is possible to really have this value but ok to recompute
         protected LogicSignature logicSign_ = -1;
 
-        public override string ExplainMoreDetails(int depth, ExplainOption option) => PrintFilter(filter_, depth, option);
+        public override string ExplainMoreDetails(int depth, ExplainOption option) => ExplainFilter(filter_, depth, option);
 
         public override string ExplainOutput(int depth, ExplainOption option)
         {
             if (output_.Count != 0)
             {
                 string r = "Output: " + string.Join(",", output_);
-                output_.ForEach(x => r += x.PrintExprWithSubqueryExpanded(depth, option));
+                output_.ForEach(x => r += x.ExplainExprWithSubqueryExpanded(depth, option));
                 return r;
             }
             return null;
         }
 
+        public LogicNode MarkExchange(QueryOption option)
+        {
+            switch (this)
+            {
+                case LogicJoin lj:
+                    LogicNode leftshuffle, rightshuffle;
+                    if (l_() is LogicScanTable ls && !ls.tabref_.IsDistributed())
+                        leftshuffle = l_();
+                    else
+                        leftshuffle = new LogicRedistribute(l_().MarkExchange(option));
+                    if (r_() is LogicScanTable rs && !rs.tabref_.IsDistributed())
+                        rightshuffle = r_();
+                    else
+                        rightshuffle = new LogicRedistribute(r_().MarkExchange(option));
+                    lj.children_[0] = leftshuffle;
+                    lj.children_[1] = rightshuffle;
+                    break;
+                default:
+                    children_.ForEach(x => x.MarkExchange(option));
+                    break;
+            }
+
+            return this;
+        }
+
         // This is an honest translation from logic to physical plan
         public PhysicNode DirectToPhysical(QueryOption option)
         {
-            PhysicNode phy;
+            PhysicNode result;
+            PhysicNode phyfirst = null;
+            if (children_.Count != 0)
+                phyfirst = children_[0].DirectToPhysical(option);
+
             switch (this)
             {
                 case LogicScanTable ln:
@@ -94,92 +123,97 @@ namespace qpmodel.logic
                         ln.filter_.SubqueryDirectToPhysic();
                     }
                     if (index is null)
-                        phy = new PhysicScanTable(ln);
+                        result = new PhysicScanTable(ln);
                     else
-                        phy = new PhysicIndexSeek(ln, index);
+                        result = new PhysicIndexSeek(ln, index);
                     break;
                 case LogicJoin lc:
-                    var l = l_();
-                    var r = r_();
-                    Debug.Assert(!l.LeftReferencesRight(r));
+                    var phyleft = phyfirst;
+                    var phyright = r_().DirectToPhysical(option);
+                    Debug.Assert(!l_().LeftReferencesRight(r_()));
                     switch (lc)
                     {
                         case LogicSingleJoin lsmj:
-                            phy = new PhysicSingleJoin(lsmj,
-                                l.DirectToPhysical(option),
-                                r.DirectToPhysical(option));
+                            result = new PhysicSingleJoin(lsmj, phyleft, phyright);
                             break;
                         case LogicMarkJoin lmj:
-                            phy = new PhysicMarkJoin(lmj,
-                                l.DirectToPhysical(option),
-                                r.DirectToPhysical(option));
+                            result = new PhysicMarkJoin(lmj, phyleft, phyright);
                             break;
                         default:
                             // one restriction of HJ is that if build side has columns used by probe side
                             // subquries, we need to use NLJ to pass variables. It is can be fixed by changing
-                            // the way we pass parameters though.
-                            bool lhasSubqCol = TableRef.HasColsUsedBySubquries(l.InclusiveTableRefs());
+                            // the way runtime pass parameters though.
+                            //
+                            bool lhasSubqCol = TableRef.HasColsUsedBySubquries(l_().InclusiveTableRefs());
                             if (lc.filter_.FilterHashable() && !lhasSubqCol
-                                &&  (lc.type_ == JoinType.Inner || lc.type_ == JoinType.Left))
-                                phy = new PhysicHashJoin(lc,
-                                    l.DirectToPhysical(option),
-                                    r.DirectToPhysical(option));
+                                && (lc.type_ == JoinType.Inner || lc.type_ == JoinType.Left))
+                                result = new PhysicHashJoin(lc, phyleft, phyright);
                             else
-                                phy = new PhysicNLJoin(lc,
-                                    l.DirectToPhysical(option),
-                                    r.DirectToPhysical(option));
+                                result = new PhysicNLJoin(lc, phyleft, phyright);
                             break;
                     }
                     break;
                 case LogicResult lr:
-                    phy = new PhysicResult(lr);
+                    result = new PhysicResult(lr);
                     break;
                 case LogicFromQuery ls:
-                    phy = new PhysicFromQuery(ls, child_().DirectToPhysical(option));
+                    result = new PhysicFromQuery(ls, phyfirst);
                     break;
                 case LogicFilter lf:
-                    phy = new PhysicFilter(lf, child_().DirectToPhysical(option));
+                    result = new PhysicFilter(lf, phyfirst);
                     if (lf.filter_ != null)
                         lf.filter_.SubqueryDirectToPhysic();
                     break;
                 case LogicInsert li:
-                    phy = new PhysicInsert(li, child_().DirectToPhysical(option));
+                    result = new PhysicInsert(li, phyfirst);
                     break;
                 case LogicScanFile le:
-                    phy = new PhysicScanFile(le);
+                    result = new PhysicScanFile(le);
                     break;
                 case LogicAgg la:
-                    phy = new PhysicHashAgg(la, child_().DirectToPhysical(option));
+                    result = new PhysicHashAgg(la, phyfirst);
                     break;
                 case LogicOrder lo:
-                    phy = new PhysicOrder(lo, child_().DirectToPhysical(option));
+                    result = new PhysicOrder(lo, phyfirst);
                     break;
                 case LogicAnalyze lan:
-                    phy = new PhysicAnalyze(lan, child_().DirectToPhysical(option));
+                    result = new PhysicAnalyze(lan, phyfirst);
                     break;
                 case LogicIndex lindex:
-                    phy = new PhysicIndex(lindex, child_().DirectToPhysical(option));
+                    result = new PhysicIndex(lindex, phyfirst);
                     break;
                 case LogicLimit limit:
-                    phy = new PhysicLimit(limit, child_().DirectToPhysical(option));
+                    result = new PhysicLimit(limit, phyfirst);
                     break;
                 case LogicAppend append:
-                    phy = new PhysicAppend(append, l_().DirectToPhysical(option), r_().DirectToPhysical(option));
+                    result = new PhysicAppend(append, phyfirst, r_().DirectToPhysical(option));
                     break;
                 case LogicCteProducer cteproducer:
-                    phy = new PhysicCteProducer(cteproducer, child_().DirectToPhysical(option));
+                    result = new PhysicCteProducer(cteproducer, phyfirst);
                     break;
                 case LogicSequence sequence:
                     List<PhysicNode> children = sequence.children_.Select(x => x.DirectToPhysical(option)).ToList();
-                    phy = new PhysicSequence(sequence, children);
+                    result = new PhysicSequence(sequence, children);
+                    break;
+                case LogicGather gather:
+                    result = new PhysicGather(gather, phyfirst);
+                    break;
+                case LogicBroadcast bcast:
+                    result = new PhysicBroadcast(bcast, phyfirst);
+                    break;
+                case LogicRedistribute dist:
+                    result = new PhysicRedistribute(dist, phyfirst);
+                    break;
+                case LogicProjectSet ps:
+                    result = new PhysicProjectSet(ps, phyfirst);
                     break;
                 default:
                     throw new NotImplementedException();
             }
 
             if (option.profile_.enabled_)
-                phy = new PhysicProfiling(phy);
-            return phy;
+                result = new PhysicProfiling(result);
+            return result;
         }
 
         public List<TableRef> InclusiveTableRefs(bool refresh = false)
@@ -690,13 +724,13 @@ namespace qpmodel.logic
         public override string ExplainMoreDetails(int depth, ExplainOption option)
         {
             string r = null;
-            string tabs = Utils.Tabs(depth + 2);
+            string tabs = Utils.Spaces(depth + 2);
             if (aggrFns_.Count > 0)
                 r += $"Aggregates: {string.Join(", ", aggrFns_)}";
             if (groupby_ != null)
                 r += $"{(aggrFns_.Count > 0? "\n"+tabs: "")}Group by: {string.Join(", ", groupby_)}";
             if (having_ != null)
-                r += $"{("\n"+tabs)}{PrintFilter(having_, depth, option)}";
+                r += $"{("\n"+tabs)}{ExplainFilter(having_, depth, option)}";
             return r;
         }
 
@@ -773,12 +807,22 @@ namespace qpmodel.logic
             //    expr: (a1+a2+a2)+a3, sum(a+a2+(a3+a2)), 
             //  with some arrangement, we can map expr to keys
             //
+            // the exception is SRF in group by keys, push them down to ProjectSet node
+            //
             if (keys?.Count > 0)
             {
                 reqList.ForEach(x =>
                 {
                     if (exprConsistPureKeys(x, keys))
                         reqContainAggs.Add(x);
+                });
+
+                keys.ForEach(x => {
+                    if (x is FuncExpr fx && fx.isSRF_)
+                    {
+                        Debug.Assert(child_() is LogicProjectSet);
+                        reqList.Add(x);
+                    }
                 });
             }
 
@@ -1174,6 +1218,77 @@ namespace qpmodel.logic
         {
             // limit is the top node and don't remove redundant
             return base.ResolveColumnOrdinal(reqOutput, false);
+        }
+    }
+
+    // Remote exchange operators: Gather, Broadcast and Redistribution
+    //  Gather: start the execution on many other machines
+    //  Redistribution: start execution in current machine with result set redistribution
+    //  Broadcast: execution mode is the same as redistribution but broadcast result set
+    //
+    public class LogicRemoteExchange : LogicNode
+    {
+        public LogicRemoteExchange(LogicNode child)
+        {
+            children_.Add(child);
+        }
+    }
+    public class LogicGather : LogicRemoteExchange
+    {
+        public LogicGather(LogicNode child) : base(child) { }
+        public override string ToString() => $"Gather({child_()})";
+
+        public override string ExplainInlineDetails() => $"1 : {QueryOption.num_machines_}";
+    }
+
+    public class LogicBroadcast: LogicRemoteExchange
+    {
+        public LogicBroadcast(LogicNode child) : base(child) { }
+        public override string ToString() => $"Broadcast({child_()})";
+    }
+
+    public class LogicRedistribute: LogicRemoteExchange
+    {
+        public LogicRedistribute(LogicNode child) : base(child) { }
+        public override string ToString() => $"Redistribute({child_()})";
+    }
+
+    // Consider this query:
+    //    ... FROM a GROUP BY generate_series(1, a2), generate_series(1, a3)
+    // because generate_series() is a SRF, so each row from a, it will generate
+    // multiple rows. To implement this, for each row, ProjectSet invokes target
+    // functions once, cache the rows into a result set and returning one row
+    // each time. The plan looks like this:
+    // ---
+    //  Aggregate
+    //       Group Key: generate_series(1, a.a2), generate_series(1, a.a3)
+    //       ->  ProjectSet
+    //           Output: generate_series(1, a2), generate_series(1, a3)
+    //           ->  Scan table a
+    //
+    public class LogicProjectSet: LogicNode
+    {
+        public LogicProjectSet(LogicNode child)
+        {
+            children_.Add(child);
+        }
+        public override string ToString() => $"ProjectSet({child_()})";
+
+        public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
+        {
+            var ordinals = new List<int>();
+
+            var reqFromChild = new List<Expr>();
+            foreach (var v in reqOutput) {
+                if (v is FuncExpr fv && fv.isSRF_)
+                    reqFromChild.AddRange(v.RetrieveAllColExpr());
+            }
+
+            child_().ResolveColumnOrdinal(reqFromChild);
+            var childout = child_().output_;
+            output_ = CloneFixColumnOrdinal(reqOutput, childout, removeRedundant);
+            RefreshOutputRegisteration();
+            return ordinals;
         }
     }
 }

@@ -57,6 +57,9 @@ namespace qpmodel.logic
         public Optimizer optimizer_ = new Optimizer();
         public QueryOption queryOpt_ = new QueryOption();
 
+        // mark if current plan is distirbuted: it does not include children plan
+        internal bool distributed_ = false;
+
         // DEBUG support
         internal readonly string text_;
 
@@ -66,6 +69,14 @@ namespace qpmodel.logic
         public virtual BindContext Bind(BindContext parent) => null;
         public virtual LogicNode SubstitutionOptimize() => logicPlan_;
         public virtual LogicNode CreatePlan() => logicPlan_;
+
+        public ExecContext CreateExecContext()
+        {
+            if (distributed_)
+                return new DistributedContext(queryOpt_);
+            else
+                return new ExecContext(queryOpt_);
+        }
 
         public virtual List<Row> Exec()
         {
@@ -85,9 +96,9 @@ namespace qpmodel.logic
             // actual execution is needed
             var finalplan = new PhysicCollect(physicPlan_);
             physicPlan_ = finalplan;
-            var context = new ExecContext(queryOpt_);
-
             finalplan.ValidateThis();
+
+            ExecContext context = CreateExecContext();
             if (this is SelectStmt select)
                 select.OpenSubQueries(context);
             var code = finalplan.Open(context);
@@ -112,7 +123,7 @@ namespace qpmodel.logic
                 var result = stmt.Exec();
                 physicplan = "";
                 if (stmt.physicPlan_ != null)
-                    physicplan = stmt.physicPlan_.Explain(0, option?.explain_);
+                    physicplan = stmt.physicPlan_.Explain(option?.explain_);
                 error = "";
                 return result;
             }
@@ -357,7 +368,8 @@ namespace qpmodel.logic
             internal string alias_;
 
             internal NamedQuery(SelectStmt query, string alias) 
-            { 
+            {
+                Debug.Assert(query != null);
                 query_ = query;
                 alias_ = alias;
             }
@@ -368,6 +380,8 @@ namespace qpmodel.logic
                     return on.query_.Equals(query_) && string.Equals(alias_, on.alias_);
                 return false;
             }
+
+            public override int GetHashCode() => query_.GetHashCode() ^ alias_?.GetHashCode()??0;
         }
 
         // parse info
@@ -533,7 +547,7 @@ namespace qpmodel.logic
             var indexes = new List<int>();
             var filters = new List<LogicFilter>();
             var cntFilter = plan.FindNodeTypeMatch(parents, 
-                                    indexes, filters, skipFromQuery: true);
+                                    indexes, filters, skipParentType: typeof(LogicFromQuery));
 
             for (int i = 0; i < cntFilter; i++)
             {
@@ -727,6 +741,8 @@ namespace qpmodel.logic
             physicPlan_ = null;
             if (!queryOpt_.optimize_.use_memo_)
             {
+                if (distributed_)
+                    logicPlan_.MarkExchange(queryOpt_);
                 physicPlan_ = logicPlan_.DirectToPhysical(queryOpt_);
                 selection_?.ForEach(ExprHelper.SubqueryDirectToPhysic);
 

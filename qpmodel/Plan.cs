@@ -58,7 +58,8 @@ namespace qpmodel.logic
             public bool memo_disable_crossjoin_ { get; set; } = true;
             public bool memo_use_joinorder_solver_ { get; set; } = false;   // make it true by default
 
-            public int query_dop_ { get; set; } = 4;
+            // distributed query dop is the same as number of distributions
+            public int query_dop_ { get; set; } = num_machines_;
 
             // codegen controls
             public bool use_codegen_ { get; set; } = false;
@@ -83,13 +84,15 @@ namespace qpmodel.logic
             }
         }
 
-        // global static variables
-        public const int num_table_partitions_ = 4;
-        // options
+        // user specified options
         public ProfileOption profile_ = new ProfileOption();
         public OptimizeOption optimize_ = new OptimizeOption();
         public ExplainOption explain_ = new ExplainOption();
 
+        // global static variables
+        public const int num_machines_ = 10;
+
+        // codegen section
         bool saved_use_codegen_;
         public void PushCodeGenDisable() {
             saved_use_codegen_ = optimize_.use_codegen_;
@@ -105,44 +108,37 @@ namespace qpmodel.logic
         public static bool show_tablename_ = true;
         public bool show_cost_ { get; set; } = false;
         public bool show_output_ { get; set; } = true;
+        public bool show_id_ { get; set; } = false;
     }
 
-    public abstract class PlanNode<T> where T : PlanNode<T>
+    public abstract class PlanNode<T>: TreeNode<T> where T : PlanNode<T>
     {
-        [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
-        public List<T> children_ = new List<T>();
-        public bool IsLeaf() => children_.Count == 0;
-
-        // shortcut for conventional names
-        public T child_() { Debug.Assert(children_.Count == 1); return children_[0]; }
-        public T l_() { Debug.Assert(children_.Count == 2); return children_[0]; }
-        public T r_() { Debug.Assert(children_.Count == 2); return children_[1]; }
-
         // print utilities
         public virtual string ExplainOutput(int depth, ExplainOption option) => null;
         public virtual string ExplainInlineDetails() => null;
         public virtual string ExplainMoreDetails(int depth, ExplainOption option) => null;
-        protected string PrintFilter(Expr filter, int depth, ExplainOption option)
+        protected string ExplainFilter(Expr filter, int depth, ExplainOption option)
         {
             string r = null;
             if (filter != null)
             {
-                r = "Filter: " + filter.PrintString(depth);
                 // append the subquery plan align with filter
-                r += filter.PrintExprWithSubqueryExpanded(depth, option);
+                r = "Filter: " + filter;
+                r += filter.ExplainExprWithSubqueryExpanded(depth, option);
             }
             return r;
         }
 
-        public string Explain(int depth = 0, ExplainOption option = null)
+        public string Explain(ExplainOption option = null, int depth = 0)
         {
             string r = null;
             bool exp_showcost = option?.show_cost_ ?? false;
             bool exp_output = option?.show_output_ ?? true;
+            bool exp_id = option?.show_id_ ?? false;
 
             if (!(this is PhysicProfiling) && !(this is PhysicCollect))
             {
-                r = Utils.Tabs(depth);
+                r = Utils.Spaces(depth);
                 if (depth == 0)
                 {
                     if (exp_showcost && this is PhysicNode phytop)
@@ -152,7 +148,7 @@ namespace qpmodel.logic
                     r += "-> ";
 
                 // print line of <nodeName> : <Estimation> <Actual>
-                r += $"{this.GetType().Name} {ExplainInlineDetails()}";
+                r += $"{this.GetType().Name}{(exp_id?" "+_:"")} {ExplainInlineDetails()}";
                 var phynode = this as PhysicNode;
                 if (phynode != null && phynode.profile_ != null)
                 {
@@ -175,14 +171,14 @@ namespace qpmodel.logic
                 // print current node's output
                 var output = exp_output ? ExplainOutput(depth, option): null;
                 if (output != null)
-                    r += Utils.Tabs(depth + 2) + output + "\n";
+                    r += Utils.Spaces(depth + 2) + output + "\n";
                 if (details != null)
                 {
                     // remove the last \n in case the details is a subquery
                     var trailing = "\n";
                     if (details[details.Length - 1] == '\n')
                         trailing = "";
-                    r += Utils.Tabs(depth + 2) + details + trailing;
+                    r += Utils.Spaces(depth + 2) + details + trailing;
                 }
 
                 depth += 2;
@@ -195,61 +191,28 @@ namespace qpmodel.logic
             {
                 bool printAsConsumer = false;
                 if (!printAsConsumer)
-                    children_.ForEach(x => r += x.Explain(depth, option));
+                    children_.ForEach(x => r += x.Explain(option, depth));
+            }
+
+            // details of distributed query emulation
+            if (this is PhysicGather)
+            {
+                int nthreads = QueryOption.num_machines_;
+                int nshuffle = 0;
+                VisitEach(x =>
+                {
+                    if (x is PhysicRedistribute || x is PhysicBroadcast)
+                        nshuffle++;
+                });
+                r += $"\nEmulated {QueryOption.num_machines_} machines distributed run " +
+                     $"with {nthreads*(1+nshuffle)} threads\n";
             }
             return r;
         }
 
-        // traversal pattern EXISTS
-        //  if any visit returns a true, stop recursion. So if you want to
-        //  visit all nodes regardless, use TraverseEachNode(). 
-        // 
-        public bool VisitEachExists(Func<PlanNode<T>, bool> callback)
-        {
-            bool exists = callback(this);
-            if (!exists)
-            {
-                foreach (var c in children_)
-                    if (c.VisitEachExists(callback))
-                        return true;
-            }
-
-            return exists;
-        }
-
-        // traversal pattern FOR EACH
-        public void VisitEach(Action<PlanNode<T>> callback)
-        {
-            callback(this);
-            foreach (var c in children_)
-                c.VisitEach(callback);
-        }
-
-        // traversal pattern FOR EACH with parent-child relationship
-        public void VisitEach(Action<PlanNode<T>, int, PlanNode<T>> callback, bool skipFromQuery = false)
-        {
-            void visitParentAndChildren(PlanNode<T> parent,
-                        Action<PlanNode<T>, int, PlanNode<T>> callback, bool skipFromQuery = false)
-            {
-                if (skipFromQuery && parent is LogicFromQuery)
-                    return;
-
-                if (parent == this)
-                    callback(null, -1, this);
-                for (int i = 0; i < parent.children_.Count; i++)
-                {
-                    var child = parent.children_[i];
-                    callback(parent, i, child);
-                    visitParentAndChildren(child, callback, skipFromQuery);
-                }
-            }
-
-            visitParentAndChildren(this, callback, skipFromQuery);
-        }
-
         // lookup all T1 types in the tree and return the parent-target relationship
         public int FindNodeTypeMatch<T1>(List<T> parents,
-            List<int> childIndex, List<T1> targets, bool skipFromQuery = false) where T1 : PlanNode<T>
+            List<int> childIndex, List<T1> targets, Type skipParentType = null) where T1 : PlanNode<T>
         {
             VisitEach((parent, index, child)=> {
                 if (child is T1 ct)
@@ -261,7 +224,7 @@ namespace qpmodel.logic
                     // verify the parent-child relationship
                     Debug.Assert(parent is null || parent.children_[index] == child);
                 }
-            }, skipFromQuery);
+            }, skipParentType);
 
             return targets.Count;
         }
@@ -311,26 +274,34 @@ namespace qpmodel.logic
 
     public partial class SelectStmt : SQLStatement
     {
-        // locate subqueries in given expr and create plan for each
+        // locate subqueries or SRF in given expr and create plan for each
         // subquery, no change on the expr itself.
-        LogicNode subQueryExprCreatePlan(LogicNode root, Expr expr)
+        //
+        LogicNode setReturningExprCreatePlan(LogicNode root, Expr expr)
         {
             var newroot = root;
             var subplans = new List<NamedQuery>();
-            expr.VisitEachT<SubqueryExpr>(x =>
+            expr.VisitEachT<Expr>(e =>
             {
-                Debug.Assert(expr.HasSubQuery());
-                x.query_.CreatePlan();
-                subplans.Add(new NamedQuery(x.query_, null));
-
-                // functionally we don't have to do rewrite since above
-                // plan is already runnable
-                if (queryOpt_.optimize_.enable_subquery_unnest_)
+                if (e is SubqueryExpr x)
                 {
-                    // use the plan 'root' containing the subexpr 'x'
-                    var replacement = oneSubqueryToJoin(root, x);
-                    newroot = (LogicNode)newroot.SearchAndReplace(root,
-                                                            replacement);
+                    Debug.Assert(expr.HasSubQuery());
+                    x.query_.CreatePlan();
+                    subplans.Add(new NamedQuery(x.query_, null));
+
+                    // functionally we don't have to do rewrite since above
+                    // plan is already runnable
+                    if (queryOpt_.optimize_.enable_subquery_unnest_)
+                    {
+                        // use the plan 'root' containing the subexpr 'x'
+                        var replacement = oneSubqueryToJoin(root, x);
+                        newroot = (LogicNode)newroot.SearchAndReplace(root,
+                                                                replacement);
+                    }
+                }
+                else if (e is FuncExpr f && f.isSRF_) {
+                    var newchild = new LogicProjectSet(root.child_());
+                    root.children_[0] = newchild;
                 }
             });
 
@@ -448,6 +419,20 @@ namespace qpmodel.logic
             else
                 root = new LogicResult(selection_);
 
+            // distributed plan is required if any table is distributed, subquery 
+            // referenced tables are not counted here. So we may have the query 
+            // shape with main queyr not distributed but subquery is.
+            //
+            bool hasdtable = false;
+            from_.ForEach(x => hasdtable |= 
+                (x is BaseTableRef bx && bx.IsDistributed()));
+            if (hasdtable)
+            {
+                Debug.Assert(!distributed_);
+                distributed_ = true;
+                root = new LogicGather(root);
+            }
+
             return root;
         }
 
@@ -535,7 +520,7 @@ namespace qpmodel.logic
                     root = new LogicFilter(root.child_(), where_);
                 }
 
-                root = subQueryExprCreatePlan(root, where_);
+                root = setReturningExprCreatePlan(root, where_);
             }
 
             // group by / having
@@ -543,17 +528,17 @@ namespace qpmodel.logic
             {
                 root = new LogicAgg(root, groupby_, getAggFuncFromSelection(), having_);
                 if (having_ != null)
-                    root = subQueryExprCreatePlan(root, having_);
+                    root = setReturningExprCreatePlan(root, having_);
                 if (groupby_ != null)
                     groupby_.ForEach(x => {
-                        root = subQueryExprCreatePlan(root, x);
+                        root = setReturningExprCreatePlan(root, x);
                     });
             }
 
             // selection list
             selection_.ForEach(x => {
                 var oldroot = root;
-                root = subQueryExprCreatePlan(root, x);
+                root = setReturningExprCreatePlan(root, x);
                 shallExpandSelection_ |= root != oldroot;
             });
 

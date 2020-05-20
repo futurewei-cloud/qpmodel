@@ -64,7 +64,6 @@ namespace qpmodel
             var sql = "SELECT a1, sqroot(b1*a1+2) from a join b on b2=a2 where a1>1";
             var rows = SQLStatement.ExecSQL(sql, out string plan, out _);
         }
-
         static void TestDataSet2()
         {
             Random rand = new Random();
@@ -80,17 +79,6 @@ namespace qpmodel
             var sql = "SELECT 4.0*sum(inside(a1.a1))/count(*) from a a1, a a2, a a3, a a4, a a5, a a6, a a7, a a8, a a9, a a10";
             var rows = SQLStatement.ExecSQL(sql, out string plan, out _);
         }
-
-        static void doPython()
-        {
-            var engine = Python.CreateEngine();
-            var scope = engine.CreateScope();
-            var libs  = new [] { @"D:\qpmodel\packages\IronPython.2.7.9\lib\net45" };
-            engine.SetSearchPaths(libs);
-            var ret = engine.ExecuteFile(@"z:/source/naru/train_model.py", scope);
-            Console.WriteLine(ret);
-        }
-
         static void TestJobench()
         {
             var files = Directory.GetFiles(@"../../../jobench");
@@ -111,7 +99,6 @@ namespace qpmodel
                 Console.WriteLine(phyplan);
             }
         }
-
         static void TestTpcds_LoadData()
         {
             var files = Directory.GetFiles(@"../../../tpcds", "*.sql");
@@ -144,7 +131,6 @@ namespace qpmodel
             Catalog.Init();
 
             string sql = "";
-            //TestTpcds_LoadData();
 
             if (false)
             {
@@ -163,11 +149,11 @@ namespace qpmodel
                 goto doit;
             }
 
-            if (true)
+            if (false)
             { 
                 Tpcds.CreateTables();
-                //Tpcds.LoadTables("tiny");
-                //Tpcds.AnalyzeTables();
+                Tpcds.LoadTables("tiny");
+                Tpcds.AnalyzeTables();
                 // 1, 2,3,7,10,
                 // long time: 4 bad plan
                 // 6: distinct not supported, causing wrong result
@@ -176,31 +162,37 @@ namespace qpmodel
             }
 
         doit:
-            sql = "with cte as (select * from d) select * from cte where d1=1;";
-            sql = "with cte as (select * from a) select cte1.a1, cte2.a2 from cte cte1, cte cte2 where cte2.a3<3";  // ok
-            sql = "with cte as (select * from a) select * from cte cte1, cte cte2 where cte1.a2=cte2.a3 and cte1.a1> 0 order by 1;";
-            sql = "select ab.a1, cd.c1 from (select * from a join b on a1=b1) ab , (select * from c join d on c1=d1) cd where ab.a1=cd.c1";
-            sql = "select * from (select avg(a2) from a join b on a1=b1) a (a1) join b on a1=b1;";
-            sql = "with cte as (select * from a join b on a1=b1 join c on a2=c2) select * from cte cte1, cte cte2;"; // ok
-            sql = "with cte as (select count(*) from a join b on a1=b1) select * from cte cte1;"; // ok
-            sql = "with cte as (select count(*) from a join b on a1=b1) select * from cte cte1, cte cte2;";
-            sql = "with cte as (select * from d where d1=1) select * from cte cte1, cte cte2;";
-            sql = "with cte as (select * from a where a1=1) select * from cte cte1, cte cte2;";
+            sql = "select a2,b2,c2,d2 from ad, bd, cd, dd where a2=b2 and c2 = b2 and c2=d2 order by a2";
+            sql = "select count(*) from ast group by tumble(a0, interval '10' second)";
+            sql = "select round(a1, 10), count(*) from a group by round(a1, 10)";
+            sql = "select count(*) from a group by round(a1, 10)";
+            sql = "select count(*) from ast group by hop(a0, interval '5' second, interval '10' second)";
+            sql = "select round(a1, 10) from a group by a1;";
+            sql = "select abs(-a1*2), count(*) from a group by round(a1, 10);";
+            sql = "select abs(-a1*2), count(*) from a group by a1;";
+            sql = "select tumble_start(a0, interval '10' second), tumble_end(a0, interval '10' second), count(*) from ast group by tumble(a0, interval '10' second)";
+
+            var datetime = new DateTime();
+            datetime = DateTime.Now;
 
             var stopWatch = new Stopwatch();
             stopWatch.Start();
 
+            // query options might be conflicting or incomplete
             Console.WriteLine(sql);
             var a = RawParser.ParseSingleSqlStatement(sql);
+            ExplainOption.show_tablename_ = false;
             a.queryOpt_.profile_.enabled_ = true;
-            a.queryOpt_.optimize_.enable_subquery_unnest_ = true;
+            a.queryOpt_.optimize_.enable_subquery_unnest_ = false;
             a.queryOpt_.optimize_.remove_from_ = false;
             a.queryOpt_.optimize_.use_memo_ = true;
             a.queryOpt_.optimize_.enable_cte_plan_ = false;
             a.queryOpt_.optimize_.use_codegen_ = false;
-
-            //a.queryOpt_.optimize_.memo_disable_crossjoin = false;
-            //a.queryOpt_.optimize_.use_joinorder_solver = true;
+            a.queryOpt_.optimize_.memo_disable_crossjoin_ = false;
+            a.queryOpt_.optimize_.memo_use_joinorder_solver_ = false;
+            a.queryOpt_.explain_.show_output_ = true;
+            a.queryOpt_.explain_.show_id_ = false;
+            a.queryOpt_.explain_.show_cost_ = a.queryOpt_.optimize_.use_memo_;
 
             // -- Semantic analysis:
             //  - bind the query
@@ -208,44 +200,43 @@ namespace qpmodel
             a.Bind(null);
 
             // -- generate an initial plan
-            ExplainOption.show_tablename_ = false;
-            a.queryOpt_.explain_.show_output_ = false;
-            a.queryOpt_.explain_.show_cost_ =  a.queryOpt_.optimize_.use_memo_;
             var rawplan = a.CreatePlan();
             Console.WriteLine("***************** raw plan *************");
-            Console.WriteLine(rawplan.Explain(0));
+            Console.WriteLine(rawplan.Explain());
 
-            physic.PhysicNode phyplan = null;
+            // -- optimize the plan
+            PhysicNode phyplan = null;
             if (a.queryOpt_.optimize_.use_memo_)
             {
                 Console.WriteLine("***************** optimized plan *************");
                 var optplan = a.SubstitutionOptimize();
-                Console.WriteLine(optplan.Explain(0, a.queryOpt_.explain_));
+                Console.WriteLine(optplan.Explain(a.queryOpt_.explain_));
                 a.optimizer_.InitRootPlan(a);
                 a.optimizer_.OptimizeRootPlan(a, null);
                 Console.WriteLine(a.optimizer_.PrintMemo());
                 phyplan = a.optimizer_.CopyOutOptimalPlan();
                 Console.WriteLine(a.optimizer_.PrintMemo());
                 Console.WriteLine("***************** Memo plan *************");
-                Console.WriteLine(phyplan.Explain(0, a.queryOpt_.explain_));
+                Console.WriteLine(phyplan.Explain(a.queryOpt_.explain_));
             }
             else
             {
                 // -- optimize the plan
                 Console.WriteLine("-- optimized plan --");
                 var optplan = a.SubstitutionOptimize();
-                Console.WriteLine(optplan.Explain(0, a.queryOpt_.explain_));
+                Console.WriteLine(optplan.Explain(a.queryOpt_.explain_));
 
                 // -- physical plan
                 Console.WriteLine("-- physical plan --");
                 phyplan = a.physicPlan_;
-                Console.WriteLine(phyplan.Explain(0, a.queryOpt_.explain_));
+                Console.WriteLine(phyplan.Explain(a.queryOpt_.explain_));
             }
 
+            // -- output profile and query result
             Console.WriteLine("-- profiling plan --");
             var final = new PhysicCollect(phyplan);
             a.physicPlan_ = final;
-            var context = new ExecContext(a.queryOpt_);
+            ExecContext context = a.CreateExecContext();
 
             final.ValidateThis();
             if (a is SelectStmt select)
@@ -259,7 +250,7 @@ namespace qpmodel
                 CodeWriter.WriteLine(code);
                 Compiler.Run(Compiler.Compile(), a, context);
             }
-            Console.WriteLine(phyplan.Explain(0, a.queryOpt_.explain_));
+            Console.WriteLine(phyplan.Explain(a.queryOpt_.explain_));
 
             stopWatch.Stop();
             Console.WriteLine("RunTime: " + stopWatch.Elapsed); 
