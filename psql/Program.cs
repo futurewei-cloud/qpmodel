@@ -1,6 +1,7 @@
 ﻿
 using System;
 using System.IO;
+using System.Linq;
 
 using qpmodel.logic;
 
@@ -23,8 +24,7 @@ namespace psql
             return true;
         }
 
-
-        public string SQLQueryVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn)
+        public string SQLQueryVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn, string[] badQueries)
         {
             QueryOption option = new QueryOption();
             option.optimize_.TurnOnAllOptimizations();
@@ -39,24 +39,29 @@ namespace psql
             // execute the query in each file and and verify the result
             foreach (string sqlFn in sqlFiles)
             {
+                string dbg_name = Path.GetFileNameWithoutExtension(sqlFn);
+
+                if (badQueries.Contains(dbg_name) == true)
+                    continue;
+
                 // execute query
                 var sql = File.ReadAllText(sqlFn);
                 var test_result = SQLStatement.ExecSQLList(sql, option);
 
                 // construct file name for result file and write result
                 string f_name = Path.GetFileNameWithoutExtension(sqlFn);
-                string write_fn = $@"{write_dir_fn}\{f_name}.txt";
+                string write_fn = $@"{write_dir_fn}/{f_name}.txt";
 
                 File.WriteAllText(write_fn, test_result);
 
                 // construct file name of expected result
-                string expect_fn = $@"{expect_dir_fn}\{f_name}.txt";
+                string expect_fn = $@"{expect_dir_fn}/{f_name}.txt";
 
-               // verify query result against the expected result
-               if (!resultVerify(write_fn, expect_fn))
-               {
-                  return write_fn;
-               }
+                // verify query result against the expected result
+                if (!resultVerify(write_fn, expect_fn))
+                {
+                    return write_fn;
+                }
             }
             return null;
         }
@@ -65,9 +70,9 @@ namespace psql
 
     static class Program
     {
-       static void Main()
+        static void Main()
         {
-    
+
         }
     }
 }

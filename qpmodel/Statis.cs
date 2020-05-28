@@ -44,10 +44,10 @@ using TableColumn = System.Tuple<string, string>;
 
 namespace qpmodel.stat
 {
-    class StatConst 
+    class StatConst
     {
-        public const double sel_zero = 0.000000001;
-        public const double sel_one = 1.0;
+        public const double zero_ = 0.000000001;
+        public const double one_ = 1.0;
 
         public const double epsilon_ = 0.001;
     }
@@ -71,7 +71,8 @@ namespace qpmodel.stat
     // Besides these, there are V-optimal and MaxDiff histogram.
     // See Poosala et al SIGMOD 1996.
     //
-    public class Historgram {
+    public class Historgram
+    {
         public const int NBuckets_ = 100;
 
         public int depth_ { get; set; }
@@ -79,7 +80,8 @@ namespace qpmodel.stat
         public Value[] buckets_ { get; set; } = new Value[NBuckets_];
         public int[] distincts_ { get; set; } = new int[NBuckets_];
 
-        int whichBucket(Value val) {
+        int whichBucket(Value val)
+        {
             dynamic value = val;
 
             if (((dynamic)buckets_[0]).CompareTo(value) >= 0)
@@ -89,23 +91,24 @@ namespace qpmodel.stat
                 dynamic l = buckets_[i];
                 dynamic r = buckets_[i + 1];
                 if (l.CompareTo(value) <= 0 && r.CompareTo(value) > 0)
-                    return i+1;
+                    return i + 1;
             }
 
             return nbuckets_ - 1;
         }
 
-        public double EstSelectivity(string op, Value val) {
-            double selectivity = StatConst.sel_one;
+        public double? EstSelectivity(string op, Value val)
+        {
+            double selectivity = StatConst.one_;
 
-            if (!new List<String>() { "=", ">", ">=", "<","<=" }.Contains(op))
-                return selectivity;
+            if (!new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(op))
+                return null;
 
             int which = whichBucket(val);
             switch (op)
             {
                 case "=":
-                    selectivity = 1.0/(nbuckets_ * distincts_[which]);
+                    selectivity = 1.0 / (nbuckets_ * distincts_[which]);
                     break;
                 case ">":
                 case ">=":
@@ -117,14 +120,14 @@ namespace qpmodel.stat
                     break;
             }
 
-            if (selectivity == 0)
-                selectivity = StatConst.sel_zero;
+            if (selectivity == 0) return null;
             Estimator.validateSelectivity(selectivity);
             return selectivity;
         }
     }
 
-    public class MCVList {
+    public class MCVList
+    {
         public const int NValues_ = 100;
 
         public int nvalues_ { get; set; }
@@ -139,17 +142,17 @@ namespace qpmodel.stat
             Debug.Assert(total <= 1 + StatConst.epsilon_);
         }
 
-        int whichValue(Value val) {
+        int whichValue(Value val)
+        {
             return Array.IndexOf(values_, val);
         }
-        public double EstSelectivity(string op, Value val)
+        public double? EstSelectivity(string op, Value val)
         {
             if (!new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(op))
-                return StatConst.sel_one;
+                return null;
 
             int which = whichValue(val);
-            if (which == -1)
-                return StatConst.sel_zero;
+            if (which == -1) return null;
 
             double selectivity = 0.0;
             switch (op)
@@ -171,8 +174,7 @@ namespace qpmodel.stat
                     break;
             }
 
-            if (selectivity == 0)
-                selectivity = StatConst.sel_zero;
+            if (selectivity == 0) return null;
             Estimator.validateSelectivity(selectivity);
             return selectivity;
         }
@@ -188,11 +190,11 @@ namespace qpmodel.stat
     //
     public class ColumnStat
     {
-        public long n_rows_ { get; set; }        // number of rows
+        public ulong n_rows_ { get; set; }        // number of rows
         public double nullfrac_ { get; set; }    // null value percentage
-        public long n_distinct_ { get; set; }
+        public ulong n_distinct_ { get; set; }
         public Historgram hist_ { get; set; }    // value historgram
-        public MCVList mcv_   {get;  set; }
+        public MCVList mcv_ { get; set; }
 
         public ColumnStat() { }
 
@@ -203,21 +205,25 @@ namespace qpmodel.stat
             foreach (var r in samples)
             {
                 Value val = r[index];
-                if (val is null)
+                if (val is null) 
+                {
                     nNulls++;
+					continue;
+                }
 
                 values.Add(val);
             }
 
-            n_distinct_ = values.Distinct().Count();
+            n_distinct_ = (ulong)values.Distinct().Count();
             if (n_distinct_ <= MCVList.NValues_)
             {
                 mcv_ = new MCVList();
                 var groups = from value in values group value by value into newGroup orderby newGroup.Key select newGroup;
                 int i = 0;
-                foreach (var g in groups) {
+                foreach (var g in groups)
+                {
                     mcv_.values_[i] = g.Key;
-                    mcv_.freqs_[i] = (1.0 * g.Count())/values.Count();
+                    mcv_.freqs_[i] = (1.0 * g.Count()) / values.Count();
                     i++;
                 }
                 mcv_.nvalues_ = i;
@@ -243,7 +249,7 @@ namespace qpmodel.stat
             }
 
             // finalize the stats
-            n_rows_ = samples.Count;
+            n_rows_ = (ulong)samples.Count;
             Debug.Assert(nNulls <= samples.Count);
             if (samples.Count != 0)
                 nullfrac_ = nNulls / samples.Count;
@@ -265,7 +271,7 @@ namespace qpmodel.stat
             sel *= Math.Pow(ANY_CHAR_SEL, str.Count(x => x == '_'));
             sel *= Math.Pow(FIXED_CHAR_SEL, str.Count(x => x != '_' && x != '%'));
             if (sel > 1)
-                sel = StatConst.sel_one;
+                sel = StatConst.one_;
             return sel;
         }
 
@@ -273,16 +279,10 @@ namespace qpmodel.stat
         {
             if (op == "like")
                 return EstLikeSelectivity(val);
-            if (mcv_ != null)
-                return mcv_.EstSelectivity(op, val);
-            else if (hist_ != null)
-                return hist_.EstSelectivity(op, val);
-            else {
-                // only wild guess now
-                return StatConst.sel_one;
-            }
+            return mcv_?.EstSelectivity(op, val) ?? 
+                hist_?.EstSelectivity(op, val) ?? StatConst.one_;
         }
-        public long EstDistinct()
+        public ulong EstDistinct()
         {
             Debug.Assert(n_distinct_ >= 0);
             return Math.Max(1, n_distinct_);
@@ -313,7 +313,21 @@ namespace qpmodel.stat
                     }
                 }
             }
-
+            if (filter is InListExpr inPred)
+            {
+                // implementation of IN estimation
+                if (inPred.children_[0] is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
+                {
+                    selectivity = 0.0;
+                    var stat = Catalog.sysstat_.GetColumnStat(bpl.relname_, pl.colName_);
+                    for (int i = 1; i < inPred.children_.Count; ++i)
+                    {
+                        if (inPred.children_[i] is LiteralExpr pr)
+                            selectivity += stat.EstSelectivity("=", pr.val_);
+                    }
+                    return Math.Min(1.0, selectivity);
+                }
+            }
             return selectivity;
         }
 
@@ -406,16 +420,69 @@ namespace qpmodel.stat
         }
 
         // stats getters
-        public long EstCardinality(string tabName)
+        public ulong EstCardinality(string tabName)
         {
             return GetOrCreateTableStats(tabName)[0].n_rows_;
         }
 
-         public void read_serialized_stats(string statsFn)
+        public dynamic ExtractValue(JsonElement value)
+        {
+            string date_pattern = @"\d\d\d\d\-\d\d\-\d\dT\d\d\:\d\d\:\d\d";
+            dynamic candidate_value;
+
+            switch (value.ValueKind)
+            {
+                case JsonValueKind.String:
+                    candidate_value = (string)value.GetString();
+                    Match result = Regex.Match(candidate_value, date_pattern);
+
+                    if (result.Success)
+                        return DateTime.Parse(candidate_value);
+                    else
+                        return candidate_value;
+
+                case JsonValueKind.Number:
+                    double double_candidate;
+                    int int_candidate;
+
+                    if (value.TryGetInt32(out int_candidate))
+                        return int_candidate;
+                    if (value.TryGetDouble(out double_candidate))
+                        return double_candidate;
+                    else
+                        return null;
+
+                default:
+                    return null;
+            }
+        }
+
+        public void jsonPostProcess(ColumnStat stat)
+        {
+
+            if (stat.hist_ != null)
+            {
+                for (int i = 0; i < stat.hist_.buckets_.Length; i++)
+                {
+                    stat.hist_.buckets_[i] = ExtractValue((JsonElement)stat.hist_.buckets_[i]);
+                }
+            }
+
+            if (stat.mcv_ != null && stat.mcv_.nvalues_ != 0)
+            {
+                int i = 0;
+                while (stat.mcv_.values_[i] != null)
+                {
+                    stat.mcv_.values_[i] = ExtractValue((JsonElement)stat.mcv_.values_[i]);
+                    i++;
+                }
+            }
+        }
+
+        public void read_serialized_stats(string statsFn)
         {
             string jsonStr = File.ReadAllText(statsFn);
             Dictionary<string, ColumnStat> records;
-
 
             string trimmedJsonStr = Regex.Replace(jsonStr, "\\n", "");
             trimmedJsonStr = Regex.Replace(trimmedJsonStr, "\\r", "");
@@ -425,8 +492,8 @@ namespace qpmodel.stat
 
             foreach (KeyValuePair<string, ColumnStat> elem in records)
             {
-                //void SysStatsAddOrUpdate(string tabcol, ColumnStat stat)
-                SysStatsAddOrUpdate(elem.Key,  elem.Value);
+                jsonPostProcess(elem.Value);
+                SysStatsAddOrUpdate(elem.Key, elem.Value);
             }
         }
 
@@ -438,7 +505,8 @@ namespace qpmodel.stat
         }
     }
 
-    public class LogicAnalyze : LogicNode { 
+    public class LogicAnalyze : LogicNode
+    {
 
         public LogicAnalyze(LogicNode child) => children_.Add(child);
 
@@ -451,9 +519,10 @@ namespace qpmodel.stat
                 child = child.child_();
             return (child as LogicScanTable).tabref_;
         }
-     }
+    }
 
-    public class PhysicAnalyze : PhysicNode {
+    public class PhysicAnalyze : PhysicNode
+    {
         internal List<ColumnStat> stats_;
 
         public PhysicAnalyze(LogicAnalyze logic, PhysicNode l) : base(logic) => children_.Add(l);
