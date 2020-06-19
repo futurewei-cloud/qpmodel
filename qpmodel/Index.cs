@@ -57,6 +57,8 @@ namespace qpmodel.index
             def_.table_ = target;
             select_ = RawParser.ParseSingleSqlStatement
                 ($"select sysrid_, {string.Join(",", columns)} from {def_.table_.relname_}") as SelectStmt;
+            // select_ is a different statement, binding their options
+            select_.queryOpt_ = queryOpt_;
         }
 
         public override BindContext Bind(BindContext parent)
@@ -77,6 +79,7 @@ namespace qpmodel.index
 
         public override LogicNode SubstitutionOptimize()
         {
+            Debug.Assert(object.ReferenceEquals(queryOpt_, select_.queryOpt_));
             var scan = select_.SubstitutionOptimize();
             logicPlan_ = new LogicIndex(scan, def_);
             // convert to physical plan
@@ -170,9 +173,9 @@ namespace qpmodel.index
 
     public abstract class ISearchIndex
     {
-        public virtual void Insert(KeyList key, Row r) => throw new NotImplementedException();
-        public virtual List<Row> Search(string op, KeyList key) => throw new NotImplementedException();
-        public virtual List<Row> Search(KeyList l, KeyList r) => throw new NotImplementedException();
+        public abstract void Insert(KeyList key, Row r);
+        public abstract List<Row> Search(string op, KeyList key);
+        public abstract List<Row> Search(KeyList l, KeyList r);
     }
 
     public class MemoryIndex : ISearchIndex

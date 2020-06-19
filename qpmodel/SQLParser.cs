@@ -40,9 +40,9 @@ using qpmodel.dml;
 namespace qpmodel.sqlparser
 {
     // antlr requires user defined exception
-    public class AntlrCompileException : Exception
+    public class AntlrParserException : Exception
     {
-        public AntlrCompileException(string msg) => Console.WriteLine($"ERROR[Antlr]: {msg }");
+        public AntlrParserException(string msg) => Console.WriteLine($"ERROR[Antlr]: {msg }");
     }
 
     public class RawParser
@@ -266,7 +266,13 @@ namespace qpmodel.sqlparser
             return new JoinQueryRef(tabrefs, joins, constraints);
         }
         public override object VisitFromSimpleTable([NotNull] SQLiteParser.FromSimpleTableContext context)
-            => new BaseTableRef(context.table_name().GetText(), context.table_alias()?.GetText());
+        {
+            SelectStmt.TableSample sample = null;
+            if (context.tablesample_clause() != null)
+                sample = VisitTablesample_clause(context.tablesample_clause()) as SelectStmt.TableSample;
+            return new BaseTableRef(context.table_name().GetText(), context.table_alias()?.GetText(), sample);
+        }
+
         public override object VisitOrdering_term([NotNull] SQLiteParser.Ordering_termContext context)
             => new OrderTerm(Visit(context.expr()) as Expr, (!(context.K_DESC() is null)));
         public override object VisitFromJoinTable([NotNull] SQLiteParser.FromJoinTableContext context)
@@ -310,6 +316,20 @@ namespace qpmodel.sqlparser
                 }
             }
             return new FromQueryRef(query, alias, colalias);
+        }
+
+        public override object VisitTablesample_clause([NotNull] SQLiteParser.Tablesample_clauseContext context)
+        {
+            if (context.K_PERCENT() != null)
+            {
+                var percent = double.Parse(context.signed_number().NUMERIC_LITERAL().GetText());
+                return new SelectStmt.TableSample(percent);
+            }
+            else
+            {
+                var rowcnt = int.Parse(context.signed_number().NUMERIC_LITERAL().GetText());
+                return new SelectStmt.TableSample(rowcnt);
+            }
         }
 
         public override object VisitSelect_core([NotNull] SQLiteParser.Select_coreContext context)
@@ -497,8 +517,16 @@ namespace qpmodel.sqlparser
 
         public override object VisitAnalyze_stmt([NotNull] SQLiteParser.Analyze_stmtContext context)
         {
-            var tabref = new BaseTableRef(context.table_name().GetText());
-            return new AnalyzeStmt(tabref, GetRawText(context));
+            SelectStmt.TableSample sample = null;
+
+            if (context.tablesample_clause(0) != null)
+                sample = VisitTablesample_clause(context.tablesample_clause(0)) as SelectStmt.TableSample;
+
+            var tabref = new BaseTableRef(context.table_name().GetText(),
+                                          null,
+                                          sample);
+
+            return new AnalyzeStmt(tabref, GetRawText(context), sample);
         }
 
         public override object VisitDrop_table_stmt([NotNull] SQLiteParser.Drop_table_stmtContext context)
@@ -549,10 +577,6 @@ namespace qpmodel.sqlparser
         {
             SQLStatement r = null;
 
-            bool isExplain = false;
-            if (context.K_EXPLAIN() != null)
-                isExplain = true;
-
             if (context.select_stmt() != null)
                 r = Visit(context.select_stmt()) as SQLStatement;
             else if (context.create_table_stmt() != null)
@@ -571,8 +595,14 @@ namespace qpmodel.sqlparser
             if (r is null)
                 throw new NotImplementedException();
 
-            Debug.Assert(!r.explainOnly_);
-            r.explainOnly_ = isExplain;
+            if (context.K_EXPLAIN() != null)
+            {
+                r.queryOpt_.explain_.mode_ = ExplainMode.explain;
+                if (context.K_EXECUTE() != null)
+                    r.queryOpt_.explain_.mode_ = ExplainMode.analyze;
+                else if (context.K_FULL() != null)
+                    r.queryOpt_.explain_.mode_ = ExplainMode.full;
+            }
             return r;
         }
 

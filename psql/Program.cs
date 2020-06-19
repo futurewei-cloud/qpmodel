@@ -24,14 +24,16 @@ namespace psql
             return true;
         }
 
-        public string SQLQueryVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn, string[] badQueries)
+        public string SQLQueryVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn, string[] badQueries, bool explainOnly)
         {
+            string result = null;
             QueryOption option = new QueryOption();
             option.optimize_.TurnOnAllOptimizations();
             option.optimize_.remove_from_ = false;
 
             option.explain_.show_output_ = true;
-            option.explain_.show_cost_ = option.optimize_.use_memo_;
+            option.explain_.show_estCost_ = option.optimize_.use_memo_;
+            option.explain_.mode_ = explainOnly ? ExplainMode.explain : ExplainMode.full;
 
             // get a list of sql query fine names from the sql directory
             string[] sqlFiles = Directory.GetFiles(sql_dir_fn);
@@ -60,10 +62,10 @@ namespace psql
                 // verify query result against the expected result
                 if (!resultVerify(write_fn, expect_fn))
                 {
-                    return write_fn;
+                    result += write_fn + ";";
                 }
             }
-            return null;
+            return result;
         }
 
     }

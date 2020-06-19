@@ -57,7 +57,7 @@ namespace qpmodel.logic
             public bool enable_hashjoin_ { get; set; } = true;
             public bool enable_nljoin_ { get; set; } = true;
             public bool enable_indexseek_ { get; set; } = true;
-            public bool use_memo_ { get; set; } = false;      // make it true by default
+            public bool use_memo_ { get; set; } = true;
             public bool memo_disable_crossjoin_ { get; set; } = true;
             public bool memo_use_joinorder_solver_ { get; set; } = false;   // make it true by default
 
@@ -117,12 +117,20 @@ namespace qpmodel.logic
         public void PopCodeGen() => optimize_.use_codegen_ = saved_use_codegen_;
     }
 
+    public enum ExplainMode
+    {
+        explain,    // physical plan with estimated cost, execution skipped
+        analyze,    // physical plan, estimates, actual cost, results muted
+        full,       // analyze mode with results printed
+    }
+ 
     public class ExplainOption
     {
 
         [ThreadStatic]
         public static bool show_tablename_ = true;
-        public bool show_cost_ { get; set; } = false;
+        public ExplainMode mode_ { get; set; } = ExplainMode.full;
+        public bool show_estCost_ { get; set; } = false;
         public bool show_output_ { get; set; } = true;
         public bool show_id_ { get; set; } = false;
         public ExplainOption Clone() => (ExplainOption)MemberwiseClone();
@@ -149,8 +157,9 @@ namespace qpmodel.logic
         public string Explain(ExplainOption option = null, int depth = 0)
         {
             string r = null;
-            bool exp_showcost = option?.show_cost_ ?? false;
             bool exp_output = option?.show_output_ ?? true;
+            bool exp_showcost = option?.show_estCost_ ?? false;
+            bool exp_showactual = option is null ? false : option.mode_ >= ExplainMode.analyze;
             bool exp_id = option?.show_id_ ?? false;
 
             if (!(this is PhysicProfiling) && !(this is PhysicCollect))
@@ -159,13 +168,20 @@ namespace qpmodel.logic
                 if (depth == 0)
                 {
                     if (exp_showcost && this is PhysicNode phytop)
-                        r += $"Total cost: {Math.Truncate(phytop.InclusiveCost() * 100) / 100}\n";
+                    {
+                        var memorycost = "";
+                        var memory = phytop.InclusiveMemory();
+                        if (memory != 0)
+                            memorycost = $", memory={memory}"; 
+                        r += $"Total cost: {Math.Truncate(phytop.InclusiveCost() * 100) / 100}{memorycost}\n";
+                    }
                 }
                 else
                     r += "-> ";
 
                 // print line of <nodeName> : <Estimation> <Actual>
-                r += $"{this.GetType().Name}{(exp_id ? " " + _ : "")} {ExplainInlineDetails()}";
+                var id = _ + (clone_.Equals("notclone") ? "" : "_" + clone_);
+                r += $"{this.GetType().Name}{(exp_id ? " " + id : "")} {ExplainInlineDetails()}";
                 var phynode = this as PhysicNode;
                 if (phynode != null && phynode.profile_ != null)
                 {
@@ -173,14 +189,20 @@ namespace qpmodel.logic
                     {
                         var incCost = Math.Truncate(phynode.InclusiveCost() * 100) / 100;
                         var cost = Math.Truncate(phynode.Cost() * 100) / 100;
-                        r += $" (inccost={incCost}, cost={cost}, rows={phynode.logic_.Card()})";
+                        var memorycost = "";
+                        var memory = phynode.Memory();
+                        if (memory != 0)
+                            memorycost = $", memory={memory}";                            
+                        r += $" (inccost={incCost}, cost={cost}, rows={phynode.logic_.Card()}{memorycost})";
                     }
-
-                    var profile = phynode.profile_;
-                    if (profile.nloops_ == 1 || profile.nloops_ == 0)
-                        r += $" (actual rows={profile.nrows_})";
-                    else
-                        r += $" (actual rows={profile.nrows_ / profile.nloops_}, loops={profile.nloops_})";
+                    if (exp_showactual)
+                    {
+                        var profile = phynode.profile_;
+                        if (profile.nloops_ == 1 || profile.nloops_ == 0)
+                            r += $" (actual rows={profile.nrows_})";
+                        else
+                            r += $" (actual rows={profile.nrows_ / profile.nloops_}, loops={profile.nloops_})";
+                    }
                 }
                 r += "\n";
                 var details = ExplainMoreDetails(depth, option);
@@ -225,48 +247,6 @@ namespace qpmodel.logic
                      $"with {nthreads * (1 + nshuffle)} threads\n";
             }
             return r;
-        }
-
-        // lookup all T1 types in the tree and return the parent-target relationship
-        public int FindNodeTypeMatch<T1>(List<T> parents,
-            List<int> childIndex, List<T1> targets, Type skipParentType = null) where T1 : PlanNode<T>
-        {
-            VisitEach((parent, index, child) =>
-            {
-                if (child is T1 ct)
-                {
-                    parents?.Add((T)parent);
-                    childIndex?.Add(index);
-                    targets.Add(ct);
-
-                    // verify the parent-child relationship
-                    Debug.Assert(parent is null || parent.children_[index] == child);
-                }
-            }, skipParentType);
-
-            return targets.Count;
-        }
-        public int FindNodeTypeMatch<T1>(List<T1> targets) where T1 : PlanNode<T> => FindNodeTypeMatch<T1>(null, null, targets);
-        public int CountNodeTypeMatch<T1>() where T1 : PlanNode<T> => FindNodeTypeMatch<T1>(new List<T1>());
-
-        public PlanNode<T> SearchAndReplace(PlanNode<T> target, PlanNode<T> replacement)
-        {
-            PlanNode<T> ret = null;
-            VisitEach((parent, index, child) =>
-            {
-                if (child == target)
-                {
-                    if (parent is null)
-                        ret = replacement;
-                    else
-                    {
-                        parent.children_[index] = (T)replacement;
-                        ret = this;
-                    }
-                }
-            });
-
-            return ret;
         }
 
         public override int GetHashCode()
@@ -358,6 +338,8 @@ namespace qpmodel.logic
                 {
                     case BaseTableRef bref:
                         from = new LogicScanTable(bref);
+                        if (bref.tableSample_ != null)
+                            from = new LogicSampleScan(from, bref.tableSample_);
                         break;
                     case ExternalTableRef eref:
                         from = new LogicScanFile(eref);
@@ -411,7 +393,7 @@ namespace qpmodel.logic
                         from = new LogicFilter(subjoin, filterexpr);
                         break;
                     default:
-                        throw new Exception();
+                        throw new InvalidProgramException();
                 }
 
                 return from;
@@ -449,6 +431,9 @@ namespace qpmodel.logic
             {
                 Debug.Assert(!distributed_);
                 distributed_ = true;
+
+                // FIXME: we have to disable memo optimization before property enforcement done
+                queryOpt_.optimize_.use_memo_ = false;
                 root = new LogicGather(root);
             }
 
@@ -756,7 +741,7 @@ namespace qpmodel.logic
                 {
                     from_[i] = chainUpToFindCte(context, bref.relname_, bref.alias_);
                     if (from_[i] is null)
-                        throw new Exception($@"table '{bref.relname_}' not exists");
+                        throw new SemanticAnalyzeException($@"table '{bref.relname_}' not exists");
                 }
             }
 
@@ -772,7 +757,7 @@ namespace qpmodel.logic
                         if (Catalog.systable_.TryTable(eref.baseref_.relname_) != null)
                             context.RegisterTable(eref);
                         else
-                            throw new Exception($@"base table '{eref.baseref_.relname_}' not exists");
+                            throw new SemanticAnalyzeException($@"base table '{eref.baseref_.relname_}' not exists");
                         break;
                     case QueryRef qref:
                         if (qref.query_.bindContext_ is null)
@@ -820,7 +805,7 @@ namespace qpmodel.logic
                 foreach (var s in selection)
                 {
                     if (s.outputName_ != null)
-                        newv = newv.SearchReplace(s.outputName_, s, false);
+                        newv = newv.SearchAndReplace(s.outputName_, s, false);
                 }
                 newlist.Add(newv);
             }

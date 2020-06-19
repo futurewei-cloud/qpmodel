@@ -50,6 +50,7 @@ namespace qpmodel.unittest
     // Test Utils
     public class TU
     {
+        [ThreadStatic]
         static internal string error_ = null;
         static internal List<Row> ExecuteSQL(string sql) => ExecuteSQL(sql, out _);
 
@@ -180,7 +181,7 @@ namespace qpmodel.unittest
             }
             catch (Exception e)
             {
-                Assert.IsTrue(e.Message.Contains("SemanticAnalyzeException"));
+                Assert.IsTrue(e.Message.Contains("duplicated"));
             }
             sql = "create table a (a1 int, a2 char(10), a3 datetime, a4 numeric(9,2), " +
                 "a5 numeric(9), a6 double, a7 date, a8 varchar(100), primary key (a1));";
@@ -197,6 +198,9 @@ namespace qpmodel.unittest
         public void TestAnalyze()
         {
             var sql = "analyze a;";
+            SQLStatement.ExecSQL(sql, out _, out _);
+
+            sql = "analyze a tablesample row (15)";
             SQLStatement.ExecSQL(sql, out _, out _);
         }
     }
@@ -301,7 +305,7 @@ namespace qpmodel.unittest
             try
             {
                 ExplainOption.show_tablename_ = false;
-                RunFolderAndVerify(sql_dir_fn, write_dir_fn, expect_dir_fn, badQueries);
+                RunFolderAndVerify(sql_dir_fn, write_dir_fn, expect_dir_fn, badQueries, scale == "1");
             }
             finally
             {
@@ -333,10 +337,11 @@ namespace qpmodel.unittest
             }
         }
 
-        void RunFolderAndVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn, string[] badQueries)
+        // true on success and false on failure
+        void RunFolderAndVerify(string sql_dir_fn, string write_dir_fn, string expect_dir_fn, string[] badQueries, bool explainOnly = false)
         {
             QueryVerify qv = new QueryVerify();
-            var result = qv.SQLQueryVerify(sql_dir_fn, write_dir_fn, expect_dir_fn, badQueries);
+            var result = qv.SQLQueryVerify(sql_dir_fn, write_dir_fn, expect_dir_fn, badQueries, explainOnly);
             if (result != null) Debug.WriteLine(result);
             Assert.IsNull(result);
         }
@@ -668,7 +673,7 @@ namespace qpmodel.unittest
             sql = "select b.a1 + b.a2 from (select a1 from a) b";
             result = ExecuteSQL(sql);
             Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("exists"));
             sql = "select b.a1 + a2 from (select a1,a2 from a) b";
             TU.ExecuteSQL(sql, "1;3;5");
             sql = "select a3 from (select a1,a3 from a) b";
@@ -689,9 +694,9 @@ namespace qpmodel.unittest
             TU.PlanAssertEqual(answer, phyplan);
 
             sql = "select b1, b2 from (select a3, a4 from a) b(b2);";
-            result = ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            result = ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("b1"));
             sql = "select b2 from (select a3, a4 from a) b(b2,b3,b4);";
-            result = ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            result = ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("more"));
             sql = "select sum(a12) from (select a1*a2 a12 from a);";
             TU.ExecuteSQL(sql, "8");
             sql = "select sum(a12) from (select a1*a2 a12 from a) b;";
@@ -823,13 +828,13 @@ namespace qpmodel.unittest
         {
             var sql = "select a1, a3  from a where a.a1 = (select b1,b2 from b)";
             var result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("one"));
             sql = "select a1, a2  from a where a.a1 = (select b1 from b)";
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticExecutionException"));
+            Assert.IsTrue(TU.error_.Contains("one"));
             sql = "select a1,a1,a3,a3, (select * from b where b2=2) from a where a1>1"; // * handling
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("one"));
 
             // subquery in selection
             sql = "select a1,a1,a3,a3, (select b3 from b where b2=2) from a where a1>1"; TU.ExecuteSQL(sql, "2,2,4,4,3");
@@ -910,7 +915,7 @@ namespace qpmodel.unittest
 
                 // runtime error: more than one row inside
                 sql = "select a1 from a where a2 > (select b1 from b where b3>=a3);";
-                var result = TU.ExecuteSQL(sql, out phyplan, option); Assert.IsTrue(TU.error_.Contains("SemanticExecutionException"));
+                var result = TU.ExecuteSQL(sql, out phyplan, option); Assert.IsTrue(TU.error_.Contains("one row"));
             }
         }
 
@@ -978,13 +983,13 @@ namespace qpmodel.unittest
             var sql = "select a1 from(select b1 as a1 from b) c;";
             TU.ExecuteSQL(sql, "0;1;2");
             sql = "select b1 from(select b1 as a1 from b) c;";
-            var result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            var result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("b1"));
             sql = "select b1 from(select b1 as a1 from b) c(b1);"; TU.ExecuteSQL(sql, "0;1;2");
 
             sql = "select b1+c100 from (select count(*) as b1 from b) a, (select c1 c100 from c) c where c100>1"; TU.ExecuteSQL(sql, "5");
             sql = "select 5 as a6 from a where a6 > 2;";    // a6 is an output name
             result = TU.ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("a6"));
             sql = "select* from(select 5 as a6 from a where a1 > 1)b where a6 > 1;"; TU.ExecuteSQL(sql, "5");
 
             sql = "select a.b1+c.b1 from (select count(*) as b1 from b) a, (select c1 b1 from c) c where c.b1>1;"; TU.ExecuteSQL(sql, "5");
@@ -999,14 +1004,14 @@ namespace qpmodel.unittest
 
             sql = "select c1 as c2, c3 from c join d on c1 = d1 and c2=d1;";
             result = TU.ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("conflicting"));
             sql = "select c2, c1+c1 as c2, c3 from c join d on c1 = d1 and (c2+c2)>d1;"; TU.ExecuteSQL(sql, "1,0,2;2,2,3;3,4,4");
 
             // table alias
             sql = "select * from a , a;";
-            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("once"));
             sql = "select * from b , a b;";
-            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("once"));
             sql = "select a1,a2,b2 from b, a where a1=b1 and a1 < (select a2 from a where a2=b2);"; TU.ExecuteSQL(sql, "0,1,1;1,2,2;2,3,3");
         }
     }
@@ -1019,7 +1024,9 @@ namespace qpmodel.unittest
         {
             var expected = new DateTime(2001, 2, 2).ToString();
             var sql = "select cast('2001-01-3' as date) + interval '30' day;"; TU.ExecuteSQL(sql, expected);
-            sql = "select cast('2001-01-3' as date) + 30 days;"; TU.ExecuteSQL(sql, expected);
+            QueryOption option = new QueryOption();
+            option.optimize_.use_memo_ = true;
+            sql = "select cast('2001-01-3' as date) + 30 days;"; TU.ExecuteSQL(sql, expected, out _, option);
         }
 
         [TestMethod]
@@ -1202,7 +1209,7 @@ namespace qpmodel.unittest
             sql = "select b.a1 + a2 from (select a1,a2,a4,a2,a1 from a, c) b";
             result = ExecuteSQL(sql);
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("ambigous"));
         }
 
         [TestMethod]
@@ -1327,17 +1334,21 @@ namespace qpmodel.unittest
             Assert.AreEqual(3, TU.CountStr(phyplan, "PhysicHashJoin"));
             Assert.AreEqual(3, result.Count);
 
-            // FIXME: becuase join order prevents push down - comparing below 2 cases
+            // Before MEMO, becuase join order prevents push down - comparing below 2 cases. MEMO can resolve their difference.
+            var option = new QueryOption();
             sql = "select * from a, b, c where a1 = b1 and b2 = c2;";
             TU.ExecuteSQL(sql, "0,1,2,3,0,1,2,3,0,1,2,3;1,2,3,4,1,2,3,4,1,2,3,4;2,3,4,5,2,3,4,5,2,3,4,5", out phyplan);
             Assert.AreEqual(2, TU.CountStr(phyplan, "PhysicHashJoin"));
             sql = "select * from a, b, c where a1 = b1 and a1 = c1;";
-            TU.ExecuteSQL(sql, "0,1,2,3,0,1,2,3,0,1,2,3;1,2,3,4,1,2,3,4,1,2,3,4;2,3,4,5,2,3,4,5,2,3,4,5", out phyplan);
-            Assert.AreEqual(1, TU.CountStr(phyplan, "HashJoin"));
+            option.optimize_.use_memo_ = false;
+            TU.ExecuteSQL(sql, "0,1,2,3,0,1,2,3,0,1,2,3;1,2,3,4,1,2,3,4,1,2,3,4;2,3,4,5,2,3,4,5,2,3,4,5", out phyplan, option);
+            Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicHashJoin"));
             Assert.AreEqual(1, TU.CountStr(phyplan, "Filter: a.a1[0]=b.b1[4] and a.a1[0]=c.c1[8]"));
+            option.optimize_.use_memo_ = true;
+            TU.ExecuteSQL(sql, "0,1,2,3,0,1,2,3,0,1,2,3;1,2,3,4,1,2,3,4,1,2,3,4;2,3,4,5,2,3,4,5,2,3,4,5", out phyplan, option);
+            Assert.AreEqual(2, TU.CountStr(phyplan, "PhysicHashJoin"));
 
             // these queries depends on we can decide left/right side parameter dependencies
-            var option = new QueryOption();
             option.optimize_.enable_subquery_unnest_ = false;
             sql = "select a1+b1 from a join b on a1=b1 where a1 < (select a2 from a where a2=b2);"; TU.ExecuteSQL(sql, "0;2;4", out _, option);
             sql = "select a1+b1 from b join a on a1=b1 where a1 < (select a2 from a where a2=b2);"; TU.ExecuteSQL(sql, "0;2;4", out _, option);
@@ -1392,16 +1403,16 @@ namespace qpmodel.unittest
         {
             var sql = "select a1, sum(a1) from a group by a2";
             var result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("appear"));
             sql = "select max(sum(a)+1) from a;";
             result = ExecuteSQL(sql); Assert.IsNull(result);
             Assert.IsTrue(TU.error_.Contains("nested"));
             sql = "select a1, sum(a1) from a group by a1 having sum(a2) > a3;";
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));  // FIXME: error message doesn't propogate
+            Assert.IsTrue(TU.error_.Contains("appear"));
             sql = "select * from a having sum(a2) > a1;";
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("appear"));
 
             sql = "select 'one', count(b1), count(*), avg(b1), min(b4), count(*), min(b2)+max(b3), sum(b2) from b where b3>1000;";
             TU.ExecuteSQL(sql, "one,0,0,,,0,,");
@@ -1468,7 +1479,7 @@ namespace qpmodel.unittest
         {
             var sql = "select(4-a3)/2,(4-a3)/2*2 + 1 + min(a1), avg(a4)+count(a1), max(a1) + sum(a1 + a2) * 2 from a group by 1 order by a3";
             var result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("appear"));
 
             sql = "select(4-a3)/2,(4-a3)/2*2 + 1 + min(a1), avg(a4)+count(a1), max(a1) + sum(a1 + a2) * 2 from a group by 1 order by 1";
             result = ExecuteSQL(sql, out string phyplan);
@@ -1501,10 +1512,10 @@ namespace qpmodel.unittest
 
             var sql = "select a2,a3 from a union all select b1,b4 from b group by b1;";
             var result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("appear"));
             sql = "select a2,a3 from a union all select b1,b2 from b order by b1;"; // we allow a2
             result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("SemanticAnalyzeException"));
+            Assert.IsTrue(TU.error_.Contains("b1"));
 
             sql = "select * from a union all select * from b union all select * from c;";
             result = TU.ExecuteSQL(sql, out _, option); Assert.AreEqual(9, result.Count);
@@ -1573,10 +1584,10 @@ namespace qpmodel.unittest
             var result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
             Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
             Assert.AreEqual("2,2,,5", string.Join(";", result));
-            sql = "select * from d where 1<d1;";
+            sql = "select * from d where 2<d1;";
             result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
             Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
-            Assert.AreEqual("2,2,,5;3,3,5,6", string.Join(";", result));
+            Assert.AreEqual("3,3,5,6", string.Join(";", result));
         }
 
         [TestMethod]
@@ -1789,18 +1800,18 @@ namespace qpmodel.unittest
                                     -> PhysicSingleJoin Left (actual rows=3)
                                         Output: a.a1[0],a.a3[1],c.c3[2],a.a2[3],bo.b2[4]
                                         Filter: b__4.b4[5]=a.a3[1]+1 and bo.b3[6]=a.a3[1] and bo.b1[7]=a.a1[0]
-                                        -> PhysicNLJoin  (actual rows=3)
+                                        -> PhysicHashJoin  (actual rows=3)
                                             Output: a.a1[2],a.a3[3],c.c3[0],a.a2[4]
                                             Filter: b.b2[5]=c.c2[1]
                                             -> PhysicScanTable c (actual rows=3)
                                                 Output: c.c3[2],c.c2[1]
                                                 Filter: c.c3[2]<5
-                                            -> PhysicHashJoin  (actual rows=3, loops=3)
+                                            -> PhysicHashJoin  (actual rows=3)
                                                 Output: a.a1[2],a.a3[3],a.a2[4],b.b2[0]
                                                 Filter: a.a1[2]=b.b1[1]
-                                                -> PhysicScanTable b (actual rows=3, loops=3)
+                                                -> PhysicScanTable b (actual rows=3)
                                                     Output: b.b2[1],b.b1[0]
-                                                -> PhysicScanTable a (actual rows=3, loops=3)
+                                                -> PhysicScanTable a (actual rows=3)
                                                     Output: a.a1[0],a.a3[2],a.a2[1]
                                         -> PhysicFilter  (actual rows=3, loops=3)
                                             Output: bo.b2[0],b__4.b4[1],bo.b3[2],bo.b1[3]

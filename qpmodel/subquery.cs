@@ -142,9 +142,9 @@ namespace qpmodel.logic
             // make a filter on top of the mark join collecting all filters
             Expr topfilter;
             if (nodeAIsOnMarkJoin)
-                topfilter = nodeAFilter.SearchReplace(existExpr, LiteralExpr.MakeLiteral("true", new BoolType()));
+                topfilter = nodeAFilter.SearchAndReplace(existExpr, LiteralExpr.MakeLiteral("true", new BoolType()));
             else
-                topfilter = nodeAFilter.SearchReplace(existExpr, markerFilter);
+                topfilter = nodeAFilter.SearchAndReplace(existExpr, markerFilter);
             nodeBFilter.DeParameter(nodeA.InclusiveTableRefs());
             topfilter = topfilter.AddAndFilter(nodeBFilter);
             LogicFilter Filter = new LogicFilter(markjoin, topfilter);
@@ -271,7 +271,7 @@ namespace qpmodel.logic
             if (nodeLeftFilter != null)
             {
                 // a1 > @1 => a1 > c1
-                var decExpr = nodeLeftFilter.SearchReplace(scalarExpr, singleValueExpr);
+                var decExpr = nodeLeftFilter.SearchAndReplace(scalarExpr, singleValueExpr);
                 nonMovableFilter = new LogicFilter(singleJoinNode, decExpr);
                 nonMovableFilter.movable_ = false;
             }
@@ -523,7 +523,7 @@ namespace qpmodel.logic
             return null;
         }
 
-        public override double EstimateCost()
+        protected override double EstimateCost()
         {
             double cost = l_().Card() * r_().Card();
             return cost;
@@ -601,7 +601,7 @@ namespace qpmodel.logic
             return null;
         }
 
-        public override double EstimateCost()
+        protected override double EstimateCost()
         {
             double cost = l_().Card() * r_().Card();
             return cost;
@@ -675,7 +675,7 @@ namespace qpmodel.logic
 
             return s;
         }
-        public override double EstimateCost()
+        protected override double EstimateCost()
         {
             return logic_.Card() * 0.5;
         }
@@ -736,7 +736,7 @@ namespace qpmodel.logic
             return s;
         }
 
-        public override double EstimateCost()
+        protected override double EstimateCost()
         {
             return logic_.Card() * 0.5;
         }

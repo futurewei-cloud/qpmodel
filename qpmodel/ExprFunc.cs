@@ -406,7 +406,7 @@ namespace qpmodel.expr
             foreach (var v in args)
             {
                 if (v.HasAggFunc())
-                    throw new Exception("aggregate functions cannot be nested");
+                    throw new SemanticAnalyzeException("aggregate functions cannot be nested");
             }
         }
 
@@ -421,7 +421,7 @@ namespace qpmodel.expr
         public virtual Value Finalize(ExecContext context, Value old) => old;
 
         public override object Exec(ExecContext context, Row input)
-            => throw new Exception("aggfn [some] are stateful, they use different set of APIs");
+            => throw new InvalidProgramException("aggfn [some] are stateful, they use different set of APIs");
     }
 
     public class AggSum : AggFunc
@@ -900,7 +900,7 @@ namespace qpmodel.expr
                 case "<": return ">";
                 case "<=": return ">=";
                 case "in":
-                    throw new Exception("not switchable");
+                    throw new InvalidProgramException("not switchable");
                 default:
                     return op;
             }
@@ -992,6 +992,21 @@ namespace qpmodel.expr
             type_ = new BoolType(); Debug.Assert(Clone().Equals(this));
             Debug.Assert(this.IsBoolean());
         }
+        public List<Expr> BreakToList(bool isAnd)
+        {
+            var andorlist = new List<Expr>();
+            for (int i = 0; i < 2; i++)
+            {
+                Expr e = i == 0 ? l_() : r_();
+                if (isAnd && e is LogicAndExpr ea)
+                    andorlist.AddRange(ea.BreakToList(isAnd));
+                else if (!isAnd && e is LogicOrExpr eo)
+                    andorlist.AddRange(eo.BreakToList(isAnd));
+                else
+                    andorlist.Add(e);
+            }
+            return andorlist;
+        }
     }
 
     public class LogicAndExpr : LogicAndOrExpr
@@ -1009,20 +1024,6 @@ namespace qpmodel.expr
 
         // a AND (b OR c) AND d => [a, b OR c, d]
         //
-        public List<Expr> BreakToList()
-        {
-            var andlist = new List<Expr>();
-            for (int i = 0; i < 2; i++)
-            {
-                Expr e = i == 0 ? l_() : r_();
-                if (e is LogicAndExpr ea)
-                    andlist.AddRange(ea.BreakToList());
-                else
-                    andlist.Add(e);
-            }
-
-            return andlist;
-        }
     }
 
     public class LogicOrExpr : LogicAndOrExpr

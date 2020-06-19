@@ -271,7 +271,7 @@ namespace qpmodel.expr
             if (expr is LiteralExpr)
                 return expr;
             else
-                return expr.SearchReplace<Expr>(IsConstFn, EvalConstFn);
+                return expr.SearchAndReplace<Expr>(IsConstFn, EvalConstFn);
         }
     }
 
@@ -355,17 +355,22 @@ namespace qpmodel.expr
 
         // a>5 => [a > 5]
         // a>5 AND c>7 => [a>5, c>7]
-        public static List<Expr> FilterToAndList(this Expr filter)
+        public static List<Expr> FilterToAndOrList(this Expr filter, bool isAndOnly = false)
         {
             Debug.Assert(filter.IsBoolean());
-            var andlist = new List<Expr>();
+            var andorlist = new List<Expr>();
             if (filter is LogicAndExpr andexpr)
-                andlist = andexpr.BreakToList();
+                andorlist = andexpr.BreakToList(true);
+            else if (!isAndOnly && filter is LogicOrExpr orexpr)
+                andorlist = orexpr.BreakToList(false);
             else
-                andlist.Add(filter);
+                andorlist.Add(filter);
 
-            return andlist;
+            return andorlist;
         }
+
+        public static List<Expr> FilterToAndList(this Expr filter)
+            => filter.FilterToAndOrList(true);
 
         // Join filter pushdown may depends on join order.
         // Consider 
@@ -576,9 +581,6 @@ namespace qpmodel.expr
         // output type of the expression
         internal ColumnType type_;
 
-        // debug info
-        internal bool dbg_isCloneCopy_ = false;
-
         protected string outputName() => outputName_ != null ? $"(as {outputName_})" : null;
 
         void validateAfterBound()
@@ -644,15 +646,13 @@ namespace qpmodel.expr
         {
             var n = base.Clone();
             n.tableRefs_ = new List<TableRef>();
-            tableRefs_.ForEach(n.tableRefs_.Add);
-            n.dbg_isCloneCopy_ = true;
-
+            tableRefs_.ForEach(n.tableRefs_.Add);            
             Debug.Assert(Equals(n));
             return n;
         }
 
         // In current expression, search and replace @from with @to 
-        public Expr SearchReplace<T>(T from, Expr to, bool aggregateTableRefs = true)
+        public Expr SearchAndReplace<T>(T from, Expr to, bool aggregateTableRefs = true)
         {
             Debug.Assert(from != null);
 
@@ -669,7 +669,7 @@ namespace qpmodel.expr
             else
             {
                 var newl = new List<Expr>();
-                clone.children_.ForEach(x => newl.Add(x.SearchReplace(from, to, aggregateTableRefs)));
+                clone.children_.ForEach(x => newl.Add(x.SearchAndReplace(from, to, aggregateTableRefs)));
                 clone.children_ = newl;
             }
 
@@ -678,28 +678,6 @@ namespace qpmodel.expr
             return clone;
         }
 
-        // In current expression, search all type T and replace with callback(T)
-        public Expr SearchReplace<T>(Func<T, Expr> replacefn) where T : Expr
-        {
-            bool checkfn(Expr e) => e is T;
-            return SearchReplace<T>(checkfn, replacefn);
-        }
-
-        // generic form of search with condition @checkfn and replace with @replacefn
-        public Expr SearchReplace<T>(Func<Expr, bool> checkfn, Func<T, Expr> replacefn) where T : Expr
-        {
-            if (checkfn(this))
-                return replacefn((T)this);
-            else
-            {
-                for (int i = 0; i < children_.Count; i++)
-                {
-                    var child = children_[i];
-                    children_[i] = child.SearchReplace(checkfn, replacefn);
-                }
-                return this;
-            }
-        }
         protected static bool exprEquals(Expr l, Expr r)
         {
             if (l is null && r is null)
@@ -786,7 +764,7 @@ namespace qpmodel.expr
         public Expr DeQueryRef()
         {
             bool hasAggFunc = this.HasAggFunc();
-            var expr = SearchReplace<ColExpr>(x => x.ExprOfQueryRef(hasAggFunc));
+            var expr = SearchAndReplace<ColExpr>(x => x.ExprOfQueryRef(hasAggFunc));
             expr.ResetAggregateTableRefs();
             return expr;
         }
@@ -796,7 +774,7 @@ namespace qpmodel.expr
         // expression split into two interfaces Exec() and ExecCode() for easier usage.
         //
         public virtual Value Exec(ExecContext context, Row input)
-            => throw new Exception($"{this} subclass shall implment Exec()");
+            => throw new NotImplementedException($"{this} subclass shall implment Exec()");
         public virtual string ExecCode(ExecContext context, string input)
         {
             return $@"ExprSearch.Locate(""{_}"").Exec(context, {input}) /*{ToString()}*/";

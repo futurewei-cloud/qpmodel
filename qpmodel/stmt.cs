@@ -54,7 +54,6 @@ namespace qpmodel.logic
         public PhysicNode physicPlan_;
 
         // others
-        public bool explainOnly_ = false;
         public Optimizer optimizer_ = new Optimizer();
         public QueryOption queryOpt_ = new QueryOption();
 
@@ -91,8 +90,12 @@ namespace qpmodel.logic
                 optimizer_.OptimizeRootPlan(this, null);
                 physicPlan_ = optimizer_.CopyOutOptimalPlan();
             }
-            if (explainOnly_)
-                return null;
+
+            if (queryOpt_.explain_.mode_ == ExplainMode.explain)
+            {
+                Console.WriteLine(physicPlan_.Explain(queryOpt_.explain_));
+                return null; // empty list
+            }
 
             // actual execution is needed
             var finalplan = new PhysicCollect(physicPlan_);
@@ -111,6 +114,10 @@ namespace qpmodel.logic
                 CodeWriter.WriteLine(code);
                 Compiler.Run(Compiler.Compile(), this, context);
             }
+            if (queryOpt_.explain_.mode_ >= ExplainMode.analyze)
+            {
+                Console.WriteLine(physicPlan_.Explain(queryOpt_.explain_));
+            }
             return finalplan.rows_;
         }
 
@@ -126,17 +133,30 @@ namespace qpmodel.logic
                 var result = stmt.Exec();
                 physicplan = "";
                 if (stmt.physicPlan_ != null)
-                    physicplan = stmt.physicPlan_.Explain(option?.explain_);
+                    physicplan = stmt.physicPlan_.Explain(option?.explain_ ?? stmt.queryOpt_.explain_);
                 error = "";
                 return result;
             }
             catch (Exception e)
             {
-                error = e.Message;
-                Console.WriteLine(error);
-                stmt = null;
-                physicplan = null;
-                return null;
+                // supress two known possible expected exceptions
+                if (e is AntlrParserException || 
+                    e is SemanticAnalyzeException || 
+                    e is SemanticExecutionException)
+                {
+                    // expected errors
+                    error = e.Message;
+                    Console.Error.WriteLine(error);
+                    stmt = null;
+                    physicplan = null;
+                    return null;
+                }
+                else
+                {
+                    // throw on unexpected errors
+                    Console.Error.WriteLine(e.StackTrace);
+                    throw e;
+                }
             }
         }
 
@@ -367,6 +387,22 @@ namespace qpmodel.logic
 
     public partial class SelectStmt : SQLStatement
     {
+        public class TableSample
+        {
+            internal int rowcnt_;
+            internal double percent_ = double.NaN;
+            public TableSample(double percent)
+            {
+                Debug.Assert(percent >= 1 && percent <= 100);
+                percent_ = percent;
+            }
+            public TableSample(int rowcnt)
+            {
+                rowcnt_ = rowcnt;
+                Debug.Assert(percent_ is double.NaN);
+            }
+        }
+
         // representing a query by CTE or FROM
         public class NamedQuery
         {
@@ -660,7 +696,7 @@ namespace qpmodel.logic
             selection.ForEach(x =>
             {
                 if (x.HasSubQuery())
-                    x = x.SearchReplace<Expr>(IsSubquery, RepalceSuquerySelection);
+                    x = x.SearchAndReplace<Expr>(IsSubquery, RepalceSuquerySelection);
                 x.ResetAggregateTableRefs();
                 newselection.Add(x);
             });

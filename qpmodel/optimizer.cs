@@ -419,51 +419,47 @@ namespace qpmodel.optimizer
             return minMember_;
         }
 
-        public PhysicNode CopyOutMinLogicPhysicPlan(PhysicNode physic = null)
+        public PhysicNode CopyOutMinLogicPhysicPlan()
         {
-            if (physic is null)
-            {
-                // get the lowest inclusive cost one from the member list
-                var minmember = CalculateMinInclusiveCostMember();
-                physic = minmember.physic_;
-            }
+            // get the lowest inclusive cost one from the member list
+            // always use a clone to not change memo itself
+            //
+            var minmember = CalculateMinInclusiveCostMember();
+            var phyClone = minmember.physic_.Clone();
 
             // recursively repeat the process for all its children
-            if (physic.children_.Count > 0 && !(physic is PhysicProfiling))
+            if (phyClone.children_.Count > 0 && !(phyClone is PhysicProfiling))
             {
                 var phychildren = new List<PhysicNode>();
                 var logchildren = new List<LogicNode>();
-                foreach (var v in physic.children_)
+                foreach (var v in phyClone.children_)
                 {
                     // children shall be min cost
                     PhysicNode phychild;
-                    if (!(v is PhysicMemoRef))
-                        phychild = CopyOutMinLogicPhysicPlan(v);
-                    else
-                    {
-                        var g = (v as PhysicMemoRef).Group();
-                        phychild = g.CopyOutMinLogicPhysicPlan();
-                    }
+                    var g = (v as PhysicMemoRef).Group();
+                    phychild = g.CopyOutMinLogicPhysicPlan();
+
+                    // remount the physic and logic children list
                     phychildren.Add(phychild);
                     logchildren.Add(phychild.logic_);
                 }
 
                 // rewrite children
-                physic.children_ = phychildren;
-                physic.logic_.children_ = logchildren;
+                phyClone.children_ = phychildren;
+                phyClone.logic_.children_ = logchildren;
             }
 
-            physic.logic_ = RetrieveLogicTree(physic.logic_);
-            Debug.Assert(!(physic is PhysicMemoRef));
-            Debug.Assert(!(physic.logic_ is LogicMemoRef));
+            phyClone.logic_ = RetrieveLogicTree(phyClone.logic_);
+            Debug.Assert(!(phyClone is PhysicMemoRef));
+            Debug.Assert(!(phyClone.logic_ is LogicMemoRef));
 
             // enable profiling: we want to do it here instead of mark at the
             // end of plan copy out to avoid revisit plan tree (including expr
             // tree again)
             //
             if (memo_.stmt_.queryOpt_.profile_.enabled_)
-                physic = new PhysicProfiling(physic);
-            return physic;
+                phyClone = new PhysicProfiling(phyClone);
+            return phyClone;
         }
     }
 

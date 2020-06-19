@@ -41,7 +41,7 @@ parse
 error
  : UNEXPECTED_CHAR 
    { 
-     throw new AntlrCompileException("UNEXPECTED_CHAR=" + $UNEXPECTED_CHAR.text); 
+     throw new AntlrParserException("UNEXPECTED_CHAR=" + $UNEXPECTED_CHAR.text); 
    }
  ;
 
@@ -50,7 +50,7 @@ sql_stmt_list
  ;
 
 sql_stmt
- : ( K_EXPLAIN ( K_ANALYZE K_VERBOSE )? )? (
+ : ( K_EXPLAIN ( K_EXECUTE | K_FULL )? ( K_VERBOSE )? )? (
                                       analyze_stmt
                                       | create_index_stmt
                                       | create_table_stmt
@@ -66,7 +66,7 @@ sql_stmt
  ;
 
 analyze_stmt
- : K_ANALYZE table_name?
+ : K_ANALYZE table_name? (tablesample_clause)*
  ;
 
 create_index_stmt
@@ -237,11 +237,11 @@ result_column
  ;
 
 table_or_subquery
- : ( database_name '.' )? table_name ( K_AS? table_alias )?   #fromSimpleTable
+ : ( database_name '.' )? table_name ( K_AS? table_alias )? (tablesample_clause)?  #fromSimpleTable
  | '(' ( table_or_subquery ( ',' table_or_subquery )*
        | join_clause )
-   ')' ( K_AS? table_alias_with_columns )?										#fromJoinTable
- | '(' select_stmt ')' ( K_AS? table_alias_with_columns )?		#fromSelectStmt
+   ')' ( K_AS? table_alias_with_columns )?	(tablesample_clause)? 	               #fromJoinTable
+ | '(' select_stmt ')' ( K_AS? table_alias_with_columns )?	(tablesample_clause)?  #fromSelectStmt
  ;
 
 table_alias_with_columns
@@ -269,6 +269,10 @@ select_core
    ( K_GROUP K_BY expr ( ',' expr )* )? ( K_HAVING expr )?
  | K_VALUES '(' expr ( ',' expr )* ')' ( ',' '(' expr ( ',' expr )* ')' )*
  ;
+
+tablesample_clause
+: K_TABLESAMPLE ( K_ROW | K_PERCENT ) '(' signed_number ')'
+;
 
 compound_operator
  : K_UNION
@@ -369,6 +373,7 @@ keyword
  | K_ESCAPE
  | K_EXCEPT
  | K_EXCLUSIVE
+ | K_EXECUTE
  | K_EXISTS
  | K_EXPLAIN
  | K_FOR
@@ -571,6 +576,7 @@ K_END : E N D;
 K_ESCAPE : E S C A P E;
 K_EXCEPT : E X C E P T;
 K_EXCLUSIVE : E X C L U S I V E;
+K_EXECUTE : E X E C U T E;
 K_EXISTS : E X I S T S;
 K_EXPLAIN : E X P L A I N;
 K_FOR : F O R;
@@ -610,6 +616,7 @@ K_ON : O N;
 K_OR : O R;
 K_ORDER : O R D E R;
 K_OUTER : O U T E R;
+K_PERCENT : P E R C E N T;
 K_PLAN : P L A N;
 K_PRAGMA : P R A G M A;
 K_PRIMARY : P R I M A R Y;
@@ -627,6 +634,7 @@ K_ROW : R O W;
 K_SELECT : S E L E C T;
 K_SET : S E T;
 K_TABLE : T A B L E;
+K_TABLESAMPLE : T A B L E S A M P L E;
 K_THEN : T H E N;
 K_TO : T O;
 K_UNION : U N I O N;
