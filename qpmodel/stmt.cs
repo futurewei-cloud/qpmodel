@@ -54,7 +54,7 @@ namespace qpmodel.logic
         public PhysicNode physicPlan_;
 
         // others
-        public Optimizer optimizer_ = new Optimizer();
+        public Optimizer optimizer_;
         public QueryOption queryOpt_ = new QueryOption();
 
         // mark if current plan is distirbuted: it does not include children plan
@@ -69,6 +69,17 @@ namespace qpmodel.logic
         public virtual BindContext Bind(BindContext parent) => null;
         public virtual LogicNode SubstitutionOptimize() => logicPlan_;
         public virtual LogicNode CreatePlan() => logicPlan_;
+        public virtual SelectStmt ExtractSelect() => null;
+        public virtual PhysicNode InstallSelectPlan(PhysicNode select) => null;
+        protected PhysicNode InstallUnder<T>(PhysicNode select)
+        {
+            var node = physicPlan_;
+            while (!(node is T))
+                node = node.child_();
+            Debug.Assert(node.child_() is PhysicProfiling);
+            node.children_[0] = select;
+            return physicPlan_;
+        }
 
         public ExecContext CreateExecContext()
         {
@@ -86,8 +97,8 @@ namespace qpmodel.logic
 
             if (queryOpt_.optimize_.use_memo_)
             {
-                optimizer_.InitRootPlan(this);
-                optimizer_.OptimizeRootPlan(this, null);
+                optimizer_ = new Optimizer(this);
+                optimizer_.ExploreRootPlan(this);
                 physicPlan_ = optimizer_.CopyOutOptimalPlan();
             }
 
@@ -105,7 +116,8 @@ namespace qpmodel.logic
             ExecContext context = CreateExecContext();
             if (this is SelectStmt select)
                 select.OpenSubQueries(context);
-            var code = finalplan.Open(context);
+            finalplan.Open(context);
+            var code = context.code_;
             code += finalplan.Exec(null);
             code += finalplan.Close();
 
@@ -121,27 +133,33 @@ namespace qpmodel.logic
             return finalplan.rows_;
         }
 
-        public static List<Row> ExecSQL(string sql, out SQLStatement stmt, out string physicplan, out string error, QueryOption option = null)
+        public static List<Row> ExecSQL(SQLStatement stmt, out string physicplan, QueryOption option = null)
         {
             var optCopy = option?.Clone();
+            if (option != null)
+                stmt.queryOpt_ = optCopy;
 
+            var result = stmt.Exec();
+            physicplan = "";
+            if (stmt.physicPlan_ != null)
+                physicplan = stmt.physicPlan_.Explain(option?.explain_ ?? stmt.queryOpt_.explain_);
+            return result;
+        }
+
+        public static List<Row> ExecSQL(string sql, out SQLStatement stmt, out string physicplan, out string error, QueryOption option = null)
+        {
             try
             {
                 stmt = RawParser.ParseSingleSqlStatement(sql);
-                if (option != null)
-                    stmt.queryOpt_ = optCopy;
-                var result = stmt.Exec();
-                physicplan = "";
-                if (stmt.physicPlan_ != null)
-                    physicplan = stmt.physicPlan_.Explain(option?.explain_ ?? stmt.queryOpt_.explain_);
+                var results = ExecSQL(stmt, out physicplan, option);
                 error = "";
-                return result;
+                return results;
             }
             catch (Exception e)
             {
                 // supress two known possible expected exceptions
-                if (e is AntlrParserException || 
-                    e is SemanticAnalyzeException || 
+                if (e is AntlrParserException ||
+                    e is SemanticAnalyzeException ||
                     e is SemanticExecutionException)
                 {
                     // expected errors
@@ -167,8 +185,7 @@ namespace qpmodel.logic
         public static string ExecSQLList(string sqls, QueryOption option = null)
         {
             StatementList stmts = RawParser.ParseSqlStatements(sqls);
-            if (option != null)
-                stmts.queryOpt_ = option;
+            stmts.queryOpt_ = option;
             return stmts.ExecList();
         }
     }
@@ -198,8 +215,7 @@ namespace qpmodel.logic
             string result = "";
             foreach (var v in list_)
             {
-                v.queryOpt_ = queryOpt_;
-                var rows = ExecSQL(v.text_, out string plan, out _, queryOpt_);
+                var rows = ExecSQL(v, out string plan, queryOpt_);
 
                 // format: <sql> <plan> <result>
                 result += v.text_ + "\n";
@@ -494,12 +510,13 @@ namespace qpmodel.logic
         }
 
         // group|order by 2 => selection_[2-1]
+        // group|order by 'a' => literal('a')
         List<Expr> seq2selection(List<Expr> list, List<Expr> selection)
         {
             var converted = new List<Expr>();
             list.ForEach(x =>
             {
-                if (x is LiteralExpr xl)
+                if (x is LiteralExpr xl && xl.type_ is IntType)
                 {
                     // clone is not necessary but we have some assertions to check
                     // redundant processing, say same colexpr bound twice, I'd rather
@@ -612,7 +629,7 @@ namespace qpmodel.logic
                     if (isConst)
                     {
                         if (!trueOrFalse)
-                            andlist.Add(LiteralExpr.MakeLiteral("false", new BoolType()));
+                            andlist.Add(LiteralExpr.MakeLiteralBool(false));
                         else
                             Debug.Assert(andlist.Count == 0);
                     }
@@ -804,11 +821,19 @@ namespace qpmodel.logic
 
         internal void OpenSubQueries(ExecContext context)
         {
+            // subquery and main query are sharing the same context, so we have to disable 
+            // codegen for subqueries as their code shall not mixed (or needed)
+            //
+            context.option_.PushCodeGenDisable();
             foreach (var v in Subqueries(true))
                 v.query_.physicPlan_.Open(context);
             foreach (var v in Subqueries(false))
                 v.query_.OpenSubQueries(context);
+            context.option_.PopCodeGen();
         }
+
+        public override SelectStmt ExtractSelect() => this;
+        public override PhysicNode InstallSelectPlan(PhysicNode select) => select;
     }
 
     public class DataSet
@@ -881,7 +906,8 @@ namespace qpmodel.logic
             Console.WriteLine(physicPlan_.Explain());
 
             finalplan.ValidateThis();
-            var code = finalplan.Open(context);
+            finalplan.Open(context);
+            var code = context.code_;
             code += finalplan.Exec(null);
             code += finalplan.Close();
 

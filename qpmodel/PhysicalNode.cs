@@ -24,8 +24,6 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
-
-using Antlr4.Runtime;
 using qpmodel.codegen;
 using qpmodel.expr;
 using qpmodel.index;
@@ -36,11 +34,11 @@ using qpmodel.utils;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using BitVector = System.Int64;
 using Value = System.Object;
-
 
 namespace qpmodel.physic
 {
@@ -70,24 +68,29 @@ namespace qpmodel.physic
             VisitEach(x =>
             {
                 var phy = x as PhysicNode;
+                var phyType = phy.GetType();
                 List<Type> nocheck = new List<Type> {typeof(PhysicCollect), typeof(PhysicProfiling),
                     typeof(PhysicIndex), typeof(PhysicInsert), typeof(PhysicAnalyze)};
-                if (!nocheck.Contains(phy.GetType()))
+                if (!nocheck.Contains(phyType))
                 {
                     var log = phy.logic_;
 
-                    // we may want to check log.output_.Count != 0 but a special case is cross join 
-                    // may have one side output empty row, so let's do a rough check
+                    // we may want to check log.output_.Count != 0 but special cases inclue:
+                    // 1) cross join may have one side output empty row
+                    // 2) select 'a' from a, which does not require any columns
+                    // 3) intersect op may not require output from one side
+                    // so let's do forbid-list check
+                    //
                     if (log.output_.Count == 0)
                     {
-                        if (!VisitEachExists(x => x is PhysicNLJoin))
-                            Debug.Assert(false);
+                        List<Type> mustHaveOutput = new List<Type> {typeof(PhysicHashJoin), typeof(PhysicHashAgg), typeof(PhysicStreamAgg)};
+                        Debug.Assert(!mustHaveOutput.Contains(phyType) || VisitEachExists(x => x is PhysicNLJoin));
                     }
                 }
             });
         }
 
-        public virtual string Open(ExecContext context)
+        public virtual void Open(ExecContext context)
         {
             string s = null;
 
@@ -102,8 +105,8 @@ namespace qpmodel.physic
                 s += CreateCommonNames();
             }
 
-            children_.ForEach(x => s += x.Open(context));
-            return s;
+            context.code_ += s;
+            children_.ForEach(x => x.Open(context));
         }
 
         public virtual string Close()
@@ -145,7 +148,7 @@ namespace qpmodel.physic
         {
             if (double.IsNaN(cost_))
                 cost_ = EstimateCost();
-            Debug.Assert(cost_ >= 0 || cost_ is double.NaN);
+            Debug.Assert(cost_ >= 0);
             return cost_;
         }
         protected virtual double EstimateCost() => double.NaN;
@@ -165,7 +168,7 @@ namespace qpmodel.physic
                     incCost += x.InclusiveCost();
             });
 
-            Debug.Assert(double.IsNaN(incCost) || (incCost > Cost() || children_.Count == 0));
+            Debug.Assert(incCost > Cost() || children_.Count == 0);
             return incCost;
         }
 
@@ -293,7 +296,7 @@ namespace qpmodel.physic
         public PhysicScanTable(LogicNode logic) : base(logic) { }
         public override string ToString() => $"PScan({(logic_ as LogicScanTable).tabref_}: {Cost()})";
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
             string cs = null;
             context_ = context;
@@ -306,8 +309,9 @@ namespace qpmodel.physic
                 _physic_ = $"{this.GetType().Name}{_}";
                 cs += CreateCommonNames();
             }
-            children_.ForEach(x => cs += x.Open(context));
-            return cs;
+
+            context.code_ += cs;
+            children_.ForEach(x => x.Open(context));
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -469,6 +473,15 @@ namespace qpmodel.physic
 
             return null;
         }
+        protected override double EstimateCost()
+        {
+            var logic = (logic_) as LogicScanFile;
+            var estRowsize = logic.tabref_.baseref_.Table().EstRowSize();
+            var filename = logic.FileName();
+            FileInfo fi = new FileInfo(filename);
+            var estRowcnt = Math.Max(1, fi.Length / estRowsize);
+            return estRowcnt * 1.5;
+        }
     }
 
     public abstract class PhysicJoin : PhysicNode
@@ -627,7 +640,7 @@ namespace qpmodel.physic
             }
             return new KeyList(0);
         }
-    };
+    }
 
     public class TaggedRow
     {
@@ -647,9 +660,9 @@ namespace qpmodel.physic
             return bytes;
         }
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             Debug.Assert(logic_.filter_ != null);
 
             // recreate the left side and right side key list - can't reuse old values 
@@ -659,9 +672,8 @@ namespace qpmodel.physic
             logic.CreateKeyList(false);
             if (context.option_.optimize_.use_codegen_)
             {
-                cs += $@"var hm{_} = new Dictionary<KeyList, List<TaggedRow>>();";
+                context.code_ += $@"var hm{_} = new Dictionary<KeyList, List<TaggedRow>>();";
             }
-            return cs;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -927,18 +939,17 @@ namespace qpmodel.physic
 
         protected override double EstimateCost()
         {
-            return child_().Card() * 1.0 + logic_.Card() * 2.0;
+            return (child_().Card() * 1.0) + (logic_.Card() * 2.0);
         }
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             if (context.option_.optimize_.use_codegen_)
             {
-                cs += $@"var aggrcore{_} = {_logic_}.aggrFns_;
+                context.code_ += $@"var aggrcore{_} = {_logic_}.aggrFns_;
                    var hm{_} = new Dictionary<KeyList, Row>();";
             }
-            return cs;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -1052,14 +1063,13 @@ namespace qpmodel.physic
             return logic_.Card() * 2.0;
         }
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             if (context.option_.optimize_.use_codegen_)
             {
-                cs += $@"";
+                context.code_ += $@"";
             }
-            return cs;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -1089,7 +1099,7 @@ namespace qpmodel.physic
                     {
                         // output current grouped row if any
                         if (curGroupKey != null)
-                            FinalizeAGroupRow(context, keys, curGroupRow, callback);
+                            FinalizeAGroupRow(context, curGroupKey, curGroupRow, callback);
 
                         // start a new grouped row
                         curGroupRow = AggrCoreToRow(l);
@@ -1130,14 +1140,13 @@ namespace qpmodel.physic
             return bytes;
         }
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             if (context.option_.optimize_.use_codegen_)
             {
-                cs += $@"var set{_} = new List<Row>();";
+                context.code_ += $@"var set{_} = new List<Row>();";
             }
-            return cs;
         }
 
         // respect logic.orders_|descends_
@@ -1215,14 +1224,12 @@ namespace qpmodel.physic
 
         public bool IsCteConsumer(out CTEQueryRef qref) => (logic_ as LogicFromQuery).IsCteConsumer(out qref);
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string s = base.Open(context);
-
+            base.Open(context);
             var logic = logic_ as LogicFromQuery;
             if (logic.IsCteConsumer(out CTEQueryRef qref))
                 cteCache_ = context.TryGetCteProducer(qref.cte_.cteName_);
-            return s;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -1404,11 +1411,10 @@ namespace qpmodel.physic
 
         public PhysicCollect(PhysicNode child) : base(null) => children_.Add(child);
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
             context.Reset();
-            string s = base.Open(context);
-            return s;
+            base.Open(context);
         }
 
         public override string Close()
@@ -1479,13 +1485,12 @@ namespace qpmodel.physic
         {
             return logic_.Card() * 1;
         }
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             if (context.option_.optimize_.use_codegen_)
             {
             }
-            return cs;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -1516,7 +1521,6 @@ namespace qpmodel.physic
 
     public class PhysicLimit : PhysicNode
     {
-
         public PhysicLimit(LogicLimit logic, PhysicNode l) : base(logic) => children_.Add(l);
         public override string ToString() => $"PLIMIT({child_()}: {Cost()})";
 
@@ -1525,14 +1529,13 @@ namespace qpmodel.physic
             return logic_.Card() * 1.0;
         }
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
-            string cs = base.Open(context);
+            base.Open(context);
             if (context.option_.optimize_.use_codegen_)
             {
-                cs += $@"var nrows{_} = 0;";
+                context.code_ += $@"var nrows{_} = 0;";
             }
-            return cs;
         }
 
         public override string Exec(Func<Row, string> callback)
@@ -1588,20 +1591,19 @@ namespace qpmodel.physic
 
         public virtual string OpenConsumer(ExecContext context) => null;
         public virtual string OpenProducer(ExecContext context) => null;
-        public override string Open(ExecContext econtext)
+        public override void Open(ExecContext econtext)
         {
             var context = econtext as DistributedContext;
             var code = asConsumer_ ? OpenConsumer(context) : OpenProducer(context);
 
             // only producer inherits the bottom half of the plan
             if (!asConsumer_)
-                code += base.Open(context);
+                base.Open(context);
             else
             {
                 Debug.Assert(context_ is null);
                 context_ = context;
             }
-            return code;
         }
 
         public virtual string ExecConsumer(Func<Row, string> callback) => null;
@@ -1919,11 +1921,10 @@ namespace qpmodel.physic
 
         void PercentSampling(Row l) => throw new NotImplementedException();
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
             rand_ = new Random();
-            var srccode = base.Open(context);
-            return srccode;
+            base.Open(context);
         }
 
         public override string Exec(Func<Row, string> callback)

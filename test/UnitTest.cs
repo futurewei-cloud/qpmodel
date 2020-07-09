@@ -41,7 +41,6 @@ using qpmodel.test;
 using qpmodel.expr;
 using qpmodel.dml;
 using qpmodel.tools;
-using qpmodel.stat;
 
 using psql;
 
@@ -192,7 +191,18 @@ namespace qpmodel.unittest
 
         [TestMethod]
         public void TestCreateIndex()
-        { }
+        {
+            var sql = "create index tt2 on test(t2);";
+            var result = TU.ExecuteSQL(sql); Assert.IsNotNull(result);
+            sql = "create unique index tt2 on test(t2);";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("name"));
+            sql = "create unique index u_tt2 on test(t2);";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("duplicated"));
+            sql = "drop index u_tt2;";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result); Assert.IsTrue(TU.error_.Contains("exists"));
+            sql = "drop index tt2;";
+            result = TU.ExecuteSQL(sql); Assert.IsNotNull(result);
+        }
 
         [TestMethod]
         public void TestAnalyze()
@@ -212,17 +222,29 @@ namespace qpmodel.unittest
         public void TestJobench()
         {
             var files = Directory.GetFiles(@"../../../../jobench");
+            var stats_fn = "../../../../jobench/statistics/jobench_stats";
 
             JOBench.CreateTables();
+
+            Catalog.sysstat_.read_serialized_stats(stats_fn);
+
+            // run tests and compare plan
+            string sql_dir_fn = "../../../../jobench";
+            string write_dir_fn = $"../../../../test/regress/output/jobench";
+            string expect_dir_fn = $"../../../../test/regress/expect/jobench";
 
             // make sure all queries can generate phase one opt plan
             QueryOption option = new QueryOption();
             option.optimize_.TurnOnAllOptimizations();
-            foreach (var v in files)
+
+            try
             {
-                var sql = File.ReadAllText(v);
-                var result = TU.ExecuteSQL(sql, out string phyplan, option);
-                Assert.IsNotNull(phyplan); Assert.IsNotNull(result);
+                ExplainOption.show_tablename_ = false;
+                RunFolderAndVerify(sql_dir_fn, write_dir_fn, expect_dir_fn, new string[] { "" } );
+            }
+            finally
+            {
+                ExplainOption.show_tablename_ = true;
             }
         }
 
@@ -236,6 +258,9 @@ namespace qpmodel.unittest
             TestTpchAndComparePlan("1", new string[] { "" });
             TestTpchAndComparePlan("0001", new string[] { "" });
             TestTpchWithData();
+
+            // some primitives neeed tpch data
+            Aggregation.TestPullPushAgg();
         }
 
         void TestTpcdsWithData()
@@ -250,12 +275,12 @@ namespace qpmodel.unittest
             // 10: subquery memo not copy out
             // q000: jigzag memory allocation pattern but they are runnable with qpmodel Program.Main()
             //
-            string[] runnable = { 
+            string[] runnable = {
                 "q1", "q2", "q3", "q7", "q15", "q17", "q19", "q21", "q24", "q25",
                 "q26", "q28", "q30", "q32", "q34", "q35", "q37", "q39", "q42", "q43",
                 "q45", "q46", "q50", "q52", "q55", "q58", "q59", "q61", "q62", "q00065",
-                "q68", "q69", "q71", "q73", "q79", "q81", "q82", "q83", "q00084", 
-                "q00085", 
+                "q68", "q69", "q71", "q73", "q79", "q81", "q82", "q83", "q00084",
+                "q00085",
                 "q88", "q90", "q91", "q92", "q94", "q95", "q96", "q99"
             };
 
@@ -282,7 +307,7 @@ namespace qpmodel.unittest
             }
         }
 
-        void TestTpchAndComparePlan(string scale, string[] badQueries)
+        void TestTpchAndComparePlan(string scale, string[] badQueries, bool testIndexes = false)
         {
             var files = Directory.GetFiles(@"../../../../tpch", "*.sql");
             if (scale == "1")
@@ -295,11 +320,15 @@ namespace qpmodel.unittest
             {
                 // load data for this cale
                 Tpch.LoadTables(scale);
+
+                if (testIndexes)
+                    Tpch.CreateIndexes();
+                
                 Tpch.AnalyzeTables();
             }
 
             // run tests and compare plan
-            string sql_dir_fn = "../../../../test/regress/sql";
+            string sql_dir_fn = "../../../../tpch/";
             string write_dir_fn = $"../../../../test/regress/output/tpch{scale}";
             string expect_dir_fn = $"../../../../test/regress/expect/tpch{scale}";
             try
@@ -318,11 +347,9 @@ namespace qpmodel.unittest
             var files = Directory.GetFiles(@"../../../../tpcds", "*.sql");
             string stats_dir = "../../../../tpcds/statistics/presto/sf1";
 
-            //read_cnvt_presto_stats(string stats_dir_fn) 
-            PrestoStatsFormatter.ReadConvertPrestoStats(stats_dir);
-
             Tpcds.CreateTables();
-            // TBD: load persisted stats here
+            // load persisted stats
+            PrestoStatsFormatter.ReadConvertPrestoStats(stats_dir);
 
             // make sure all queries can generate phase one opt plan
             QueryOption option = new QueryOption();
@@ -408,7 +435,7 @@ namespace qpmodel.unittest
                 result = TU.ExecuteSQL(File.ReadAllText(files[9]), out _, option);
                 if (option.optimize_.use_memo_) Assert.AreEqual(0, TU.CountStr(phyplan, "NLJoin"));
                 Assert.AreEqual(20, result.Count);
-                TU.ExecuteSQL(File.ReadAllText(files[10]), "",  out _, option);
+                TU.ExecuteSQL(File.ReadAllText(files[10]), "", out _, option);
                 if (option.optimize_.use_memo_) Assert.AreEqual(0, TU.CountStr(phyplan, "NLJoin"));
                 TU.ExecuteSQL(File.ReadAllText(files[11]), "MAIL,5,5;SHIP,5,10", out _, option);
                 // FIXME: agg on agg from
@@ -513,6 +540,20 @@ namespace qpmodel.unittest
             Assert.AreEqual(11, memo.cgroups_.Count);
             Assert.AreEqual(26, tlogics); Assert.AreEqual(42, tphysics);
             Assert.AreEqual("0;1;2", string.Join(";", result));
+            var mstr = stmt.optimizer_.PrintMemo();
+            Assert.IsTrue(mstr.Contains("Summary: 26,42"));
+
+            // test join resolver
+            option.optimize_.memo_use_joinorder_solver_ = true;
+            result = TU.ExecuteSQL(sql, out stmt, out _, option);
+            memo = stmt.optimizer_.memoset_[0];
+            memo.CalcStats(out tlogics, out tphysics);
+            Assert.AreEqual(5, memo.cgroups_.Count);
+            Assert.AreEqual(5, tlogics); Assert.AreEqual(5, tphysics);
+            Assert.AreEqual("0;1;2", string.Join(";", result));
+            mstr = stmt.optimizer_.PrintMemo();
+            Assert.IsTrue(mstr.Contains("Summary: 5,5"));
+            option.optimize_.memo_use_joinorder_solver_ = false;
 
             sql = "select count(b1) from a,b,c,d where b.b2 = a.a2 and b.b3=c.c3 and d.d1 = a.a1";
             result = TU.ExecuteSQL(sql, out stmt, out _, option);
@@ -918,7 +959,6 @@ namespace qpmodel.unittest
                 var result = TU.ExecuteSQL(sql, out phyplan, option); Assert.IsTrue(TU.error_.Contains("one row"));
             }
         }
-
     }
 
     [TestClass]
@@ -945,7 +985,7 @@ namespace qpmodel.unittest
             var sql = $"copy test from {filename};";
             var stmt = RawParser.ParseSingleSqlStatement(sql) as CopyStmt;
             Assert.AreEqual(filename, stmt.fileName_);
-            sql = $"copy test from {filename} where a1 >1;";
+            sql = $"copy test from {filename} where t1 >1;";
             var result = TU.ExecuteSQL(sql);
         }
     }
@@ -1032,8 +1072,120 @@ namespace qpmodel.unittest
         [TestMethod]
         public void TestMisc()
         {
+            // number section
             var sql = "select round(a1, 10), count(*) from a group by round(a1, 10)"; TU.ExecuteSQL(sql, "0,1;1,1;2,1");
             sql = "select abs(-a1), count(*) from a group by abs(-a1);"; TU.ExecuteSQL(sql, "0,1;1,1;2,1");
+
+            // string section
+            sql = "select upper('aBc') || upper('');";
+            TU.ExecuteSQL(sql, "ABC");
+
+            // date section
+            sql = "select date '2020-07-06';";
+            TU.ExecuteSQL(sql, new DateTime(2020,07,06).ToString());
+            sql = "select date('2020-07-06');";
+            TU.ExecuteSQL(sql, new DateTime(2020, 07, 06).ToString());
+
+            // others
+            sql = "select coalesce(coalesce(null, 'a'), 'b');";
+            TU.ExecuteSQL(sql, "a");
+            sql = "select hash(1), hash('abc'), hash(26.33)";
+            TU.ExecuteSQL(sql);
+        }
+    }
+
+    [TestClass]
+    public class Aggregation
+    {
+        [TestMethod]
+        public void TestAggregation()
+        {
+            var sql = "select a1, sum(a1) from a group by a2";
+            var result = TU.ExecuteSQL(sql); Assert.IsNull(result);
+            Assert.IsTrue(TU.error_.Contains("appear"));
+            sql = "select max(sum(a)+1) from a;";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result);
+            Assert.IsTrue(TU.error_.Contains("nested"));
+            sql = "select a1, sum(a1) from a group by a1 having sum(a2) > a3;";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result);
+            Assert.IsTrue(TU.error_.Contains("appear"));
+            sql = "select * from a having sum(a2) > a1;";
+            result = TU.ExecuteSQL(sql); Assert.IsNull(result);
+            Assert.IsTrue(TU.error_.Contains("appear"));
+
+            sql = "select 'one', count(b1), count(*), avg(b1), min(b4), count(*), min(b2)+max(b3), sum(b2) from b where b3>1000;";
+            TU.ExecuteSQL(sql, "one,0,0,,,0,,");
+            sql = "select 'one', count(b1), count(*), avg(b1) from b where b3>1000 having avg(b2) is not null;";
+            TU.ExecuteSQL(sql, "");
+
+            sql = "select 7, (4-a3)/2*2+1+sum(a1), sum(a1)+sum(a1+a2)*2 from a group by (4-a3)/2;";
+            TU.ExecuteSQL(sql, "7,3,2;7,4,19", out string phyplan);
+            var answer = @"PhysicHashAgg  (actual rows=2)
+                            Output: 7,{4-a.a3/2}[0]*2+1+{sum(a.a1)}[1],{sum(a.a1)}[1]+{sum(a.a1+a.a2)}[2]*2
+                            Aggregates: sum(a.a1[0]), sum(a.a1[0]+a.a2[2])
+                            Group by: 4-a.a3[3]/2
+                            -> PhysicScanTable a (actual rows=3)
+                                Output: a.a1[0],a.a1[0]+a.a2[1],a.a2[1],a.a3[2]
+                        ";
+            TU.PlanAssertEqual(answer, phyplan);
+            sql = "select(4-a3)/2,(4-a3)/2*2 + 1 + min(a1), avg(a4)+count(a1), max(a1) + sum(a1 + a2) * 2 from a group by 1";
+            TU.ExecuteSQL(sql, "1,3,4,2;0,2,6,18");
+            sql = "select a1, a2  from a where a.a1 = (select sum(b1) from b where b2 = a2 and b3<4);";
+            TU.ExecuteSQL(sql, "0,1;1,2");
+            sql = "select a2, sum(a1) from a where a1>0 group by a2";
+            TU.ExecuteSQL(sql, "2,1;3,2");
+            sql = "select a3/2*2, sum(a3), count(a3), stddev_samp(a3) from a group by 1;";
+            TU.ExecuteSQL(sql, "2,5,2,0.7071;4,4,1,");
+            sql = "select count(*)+1 from (select b1+c1 from (select b1 from b) a, (select c1,c2 from c) c where c2>1) a;";
+            TU.ExecuteSQL(sql, "7");
+            sql = "select d1, sum(d2) from (select c1/2, sum(c1) from (select b1, count(*) as a1 from b group by b1)c(c1, c2) group by c1/2) d(d1, d2) group by d1;";
+            TU.ExecuteSQL(sql, "0,1;1,2");
+            sql = "select b1+b1 from b group by b1;";
+            TU.ExecuteSQL(sql, "0;2;4");
+            sql = "select sum(b1+b1) from b group by b1;";
+            TU.ExecuteSQL(sql, "0;2;4");
+            sql = "select 2+b1+b1+b2 from b group by b1,b2;";
+            TU.ExecuteSQL(sql, "3;6;9");
+            sql = "select sum(2+b1+b1+b2) from b group by b1,b2;";
+            TU.ExecuteSQL(sql, "3;6;9");
+            sql = "select max(b1) from (select sum(a1) from a)b(b1);";
+            TU.ExecuteSQL(sql, "3");
+            sql = "select sum(e1+e1*3) from (select sum(a1) a12 from a) d(e1);";
+            TU.ExecuteSQL(sql, "12");
+            sql = "select a1 from a group by a1 having sum(a2) > 2;";
+            TU.ExecuteSQL(sql, "2");
+            sql = "select a1, sum(a1) from a group by a1 having sum(a2) > 2;";
+            TU.ExecuteSQL(sql, "2,2");
+            sql = "select max(b1) from b having max(b1)>1;";
+            TU.ExecuteSQL(sql, "2");
+            sql = "select a3, sum(a1) from a group by a3 having sum(a2) > a3/2;";
+            TU.ExecuteSQL(sql, "3,1;4,2");
+            sql = "select 'a'||'b' as k, count(*) from a group by k";
+            TU.ExecuteSQL(sql, "ab,3");
+            sql = "select 'a'||'b' as k, count(*) from a group by 1";
+            TU.ExecuteSQL(sql, "ab,3");
+
+            // subquery as group by expr
+            sql = "select count(a1) from a group by (select max(a1) from a);";
+            TU.ExecuteSQL(sql, "3");
+
+            // stream aggregation
+            sql = "";
+
+            // failed:
+            // sql = "select a1, sum(a1) from a group by a1 having sum(a2) > a3;";
+            // sql = "select * from a having sum(a2) > 1;";
+        }
+
+        public static void TestPullPushAgg()
+        {
+            var sql = "select count(*) from lineitem, partsupp where l_partkey=ps_suppkey group by ps_availqty>100";
+            TU.ExecuteSQL(sql, "23294;226", out string phyplan);
+            Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicHashAgg"));
+            sql = "select sum(c) from lineitem, (select ps_suppkey, ps_availqty>100, count(*) from partsupp group by ps_suppkey, ps_availqty>100) ps(ps_suppkey, ps_availqty100, c)"
+                + " where ps_suppkey=l_partkey group by ps_availqty100;";
+            TU.ExecuteSQL(sql, "23294;226", out phyplan);
+            Assert.AreEqual(2, TU.CountStr(phyplan, "PhysicHashAgg"));
         }
     }
 
@@ -1225,7 +1377,7 @@ namespace qpmodel.unittest
             TU.PlanAssertEqual(answer, phyplan);
             sql = "select b1+c1 from (select b1 from b) a, (select c1 from c) c where c1>1";
             stmt = RawParser.ParseSingleSqlStatement(sql);
-            SQLStatement.ExecSQL(sql, out phyplan, out _);// FIXME: filter is still there
+            SQLStatement.ExecSQL(sql, out phyplan, out _); // FIXME: filter is still there
             answer = @"PhysicFilter  (actual rows=3)
                         Output: {a.b1+c.c1}[0]
                         Filter: c.c1[1]>1
@@ -1388,7 +1540,7 @@ namespace qpmodel.unittest
             {
                 var x = rand.NextDouble();
                 var y = rand.NextDouble();
-                var ret = x * x + y * y <= 1 ? 1 : 0;
+                var ret = ((x * x) + (y * y)) <= 1 ? 1 : 0;
                 return ret;
             }
 
@@ -1396,82 +1548,6 @@ namespace qpmodel.unittest
             sql = "SELECT 4.0*sum(inside(a1.a1))/count(*) from a a1, a a2, a a3, a a4, a a5, a a6, a a7, a a8, a a9, a a10";
             rows = SQLStatement.ExecSQL(sql, out _, out _);
             Assert.IsTrue((double)rows[0][0] > 3.12 && (double)rows[0][0] < 3.16);
-        }
-
-        [TestMethod]
-        public void TestAggregation()
-        {
-            var sql = "select a1, sum(a1) from a group by a2";
-            var result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("appear"));
-            sql = "select max(sum(a)+1) from a;";
-            result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("nested"));
-            sql = "select a1, sum(a1) from a group by a1 having sum(a2) > a3;";
-            result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("appear"));
-            sql = "select * from a having sum(a2) > a1;";
-            result = ExecuteSQL(sql); Assert.IsNull(result);
-            Assert.IsTrue(TU.error_.Contains("appear"));
-
-            sql = "select 'one', count(b1), count(*), avg(b1), min(b4), count(*), min(b2)+max(b3), sum(b2) from b where b3>1000;";
-            TU.ExecuteSQL(sql, "one,0,0,,,0,,");
-            sql = "select 'one', count(b1), count(*), avg(b1) from b where b3>1000 having avg(b2) is not null;";
-            TU.ExecuteSQL(sql, "");
-
-            sql = "select 7, (4-a3)/2*2+1+sum(a1), sum(a1)+sum(a1+a2)*2 from a group by (4-a3)/2;";
-            TU.ExecuteSQL(sql, "7,3,2;7,4,19", out string phyplan);
-            var answer = @"PhysicHashAgg  (actual rows=2)
-                            Output: 7,{4-a.a3/2}[0]*2+1+{sum(a.a1)}[1],{sum(a.a1)}[1]+{sum(a.a1+a.a2)}[2]*2
-                            Aggregates: sum(a.a1[0]), sum(a.a1[0]+a.a2[2])
-                            Group by: 4-a.a3[3]/2
-                            -> PhysicScanTable a (actual rows=3)
-                                Output: a.a1[0],a.a1[0]+a.a2[1],a.a2[1],a.a3[2]
-                        ";
-            TU.PlanAssertEqual(answer, phyplan);
-            sql = "select(4-a3)/2,(4-a3)/2*2 + 1 + min(a1), avg(a4)+count(a1), max(a1) + sum(a1 + a2) * 2 from a group by 1";
-            TU.ExecuteSQL(sql, "1,3,4,2;0,2,6,18");
-            sql = "select a1, a2  from a where a.a1 = (select sum(b1) from b where b2 = a2 and b3<4);";
-            TU.ExecuteSQL(sql, "0,1;1,2");
-            sql = "select a2, sum(a1) from a where a1>0 group by a2";
-            TU.ExecuteSQL(sql, "2,1;3,2");
-            sql = "select a3/2*2, sum(a3), count(a3), stddev_samp(a3) from a group by 1;";
-            TU.ExecuteSQL(sql, "2,5,2,0.7071;4,4,1,");
-            sql = "select count(*)+1 from (select b1+c1 from (select b1 from b) a, (select c1,c2 from c) c where c2>1) a;";
-            TU.ExecuteSQL(sql, "7");
-            sql = "select d1, sum(d2) from (select c1/2, sum(c1) from (select b1, count(*) as a1 from b group by b1)c(c1, c2) group by c1/2) d(d1, d2) group by d1;";
-            TU.ExecuteSQL(sql, "0,1;1,2");
-            sql = "select b1+b1 from b group by b1;";
-            TU.ExecuteSQL(sql, "0;2;4");
-            sql = "select sum(b1+b1) from b group by b1;";
-            TU.ExecuteSQL(sql, "0;2;4");
-            sql = "select 2+b1+b1+b2 from b group by b1,b2;";
-            TU.ExecuteSQL(sql, "3;6;9");
-            sql = "select sum(2+b1+b1+b2) from b group by b1,b2;";
-            TU.ExecuteSQL(sql, "3;6;9");
-            sql = "select max(b1) from (select sum(a1) from a)b(b1);";
-            TU.ExecuteSQL(sql, "3");
-            sql = "select sum(e1+e1*3) from (select sum(a1) a12 from a) d(e1);";
-            TU.ExecuteSQL(sql, "12");
-            sql = "select a1 from a group by a1 having sum(a2) > 2;";
-            TU.ExecuteSQL(sql, "2");
-            sql = "select a1, sum(a1) from a group by a1 having sum(a2) > 2;";
-            TU.ExecuteSQL(sql, "2,2");
-            sql = "select max(b1) from b having max(b1)>1;";
-            TU.ExecuteSQL(sql, "2");
-            sql = "select a3, sum(a1) from a group by a3 having sum(a2) > a3/2;";
-            TU.ExecuteSQL(sql, "3,1;4,2");
-
-            // subquery as group by expr
-            sql = "select count(a1) from a group by (select max(a1) from a);";
-            TU.ExecuteSQL(sql, "3");
-
-            // stream aggregation
-            sql = "";
-
-            // failed:
-            // sql = "select a1, sum(a1) from a group by a1 having sum(a2) > a3;";
-            // sql = "select * from a having sum(a2) > 1;";
         }
 
         [TestMethod]
@@ -1588,6 +1664,19 @@ namespace qpmodel.unittest
             result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
             Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
             Assert.AreEqual("3,3,5,6", string.Join(";", result));
+            sql = "select * from d where 2<=d1;";
+            result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
+            Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
+            Assert.AreEqual("2,2,,5;3,3,5,6", string.Join(";", result));
+            sql = "select * from d where 2>d1;";
+            result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
+            Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
+            Assert.AreEqual("0,1,2,3;1,2,,4", string.Join(";", result));
+            sql = "select * from d where 1>=d1;";
+            result = SQLStatement.ExecSQL(sql, out phyplan, out _, option);
+            Assert.AreEqual(1, TU.CountStr(phyplan, "PhysicIndexSeek"));
+            Assert.AreEqual("0,1,2,3;1,2,,4", string.Join(";", result));
+            // TODO: not support 2<d1 AND d1<5
         }
 
         [TestMethod]
@@ -1925,6 +2014,48 @@ namespace qpmodel.unittest
             var sql = "select count(*) from ast group by hop(a0, interval '5' second, interval '10' second)";
             TU.ExecuteSQL(sql, "2;4;2;1;1", out phyplan);
             Assert.AreEqual(1, TU.CountStr(phyplan, "ProjectSet"));
+        }
+    }
+
+    [TestClass]
+    public class Cardinality
+    {
+        internal void CheckTableLoad()
+        {
+            Tpch.CreateTables();
+            Tpch.LoadTables("0001");
+            Tpch.AnalyzeTables();
+        }
+
+        [TestMethod]
+        public void PrimitiveTest()
+        {
+            CheckTableLoad();
+
+            var option = new QueryOption();
+            option.explain_.mode_ = ExplainMode.analyze;
+            option.explain_.show_estCost_ = true;
+
+            string allquery = File.ReadAllText("../../../regress/sql/ce.sql");
+            string[] listquery = allquery.Split(';');
+
+            List<string> listoutput = new List<string>();
+
+            for (int i = 0; i < listquery.Length; i++)
+            {
+                string sql = listquery[i].Trim();
+                if (sql.Length <= 0) continue;
+
+                var result = SQLStatement.ExecSQL(sql, out string physicplan, out string error_, option);
+                Assert.IsNotNull(physicplan);
+
+                listoutput.Add(physicplan);
+            }
+            string alloutput = string.Join('\n', listoutput);
+            File.WriteAllText($"../../../regress/output/ce.out", alloutput);
+
+            string expected = File.ReadAllText($"../../../regress/expect/ce.out").Replace("\r", "");
+            Assert.AreEqual(alloutput, expected);
         }
     }
 }

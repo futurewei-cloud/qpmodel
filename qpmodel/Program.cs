@@ -207,9 +207,8 @@ namespace qpmodel
                 Console.WriteLine("***************** optimized plan *************");
                 var optplan = a.SubstitutionOptimize();
                 Console.WriteLine(optplan.Explain(a.queryOpt_.explain_));
-                a.optimizer_.InitRootPlan(a);
-                a.optimizer_.OptimizeRootPlan(a, null);
-                Console.WriteLine(a.optimizer_.PrintMemo());
+                a.optimizer_ = new Optimizer(a);
+                a.optimizer_.ExploreRootPlan(a);
                 phyplan = a.optimizer_.CopyOutOptimalPlan();
                 Console.WriteLine(a.optimizer_.PrintMemo());
                 Console.WriteLine("***************** Memo plan *************");
@@ -237,7 +236,8 @@ namespace qpmodel
             final.ValidateThis();
             if (a is SelectStmt select)
                 select.OpenSubQueries(context);
-            var code = final.Open(context);
+            final.Open(context);
+            var code = context.code_;
             code += final.Exec(null);
             code += final.Close();
 

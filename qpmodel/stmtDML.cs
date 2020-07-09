@@ -184,6 +184,11 @@ namespace qpmodel.dml
                 if (cols_ is null)
                     cols_ = select_.selection_;
                 Debug.Assert(select_.selection_.Count == cols_.Count);
+
+                // reject self-insertion: this can be done by snapshot scan underlying table 
+                // but not this project's scope
+                if (select_.from_.Any(x => x is BaseTableRef bx && bx.relname_.Equals(targetref_.relname_)))
+                    throw new NotImplementedException("self insertion not supported");
             }
 
             bindContext_ = context;
@@ -192,7 +197,8 @@ namespace qpmodel.dml
 
         public override LogicNode CreatePlan()
         {
-            queryOpt_.optimize_.use_memo_ = false;
+            if (select_ is null)
+                queryOpt_.optimize_.use_memo_ = false;
             logicPlan_ = select_ is null ?
                 new LogicInsert(targetref_, new LogicResult(vals_)) :
                 new LogicInsert(targetref_, select_.CreatePlan());
@@ -208,6 +214,9 @@ namespace qpmodel.dml
                 select_.logicPlan_.ResolveColumnOrdinal(select_.selection_, false);
             return logicPlan_;
         }
+
+        public override SelectStmt ExtractSelect() => select_;
+        public override PhysicNode InstallSelectPlan(PhysicNode select) => InstallUnder<PhysicInsert>(select);
     }
 
     public class CopyStmt : SQLStatement
@@ -217,6 +226,7 @@ namespace qpmodel.dml
         public readonly Expr where_;
 
         internal InsertStmt insert_;
+        internal SelectStmt select_;
 
         // copy tab(cols) from <file> <where> =>
         // insert into tab(cols) select * from foreign_table(<file>) <where>
@@ -231,15 +241,14 @@ namespace qpmodel.dml
             if (cols is null)
                 colrefs = targetref.AllColumnsRefs();
             ExternalTableRef sourcetab = new ExternalTableRef(fileName, targetref, colrefs);
-            SelectStmt select = new SelectStmt(new List<Expr> { new SelStar(null) },
+            select_ = new SelectStmt(new List<Expr> { new SelStar(null) },
                             new List<TableRef> { sourcetab }, where, null, null, null, null, null, null, text);
-            insert_ = new InsertStmt(targetref, cols, null, select, text) { queryOpt_ = queryOpt_ };
+            insert_ = new InsertStmt(targetref, cols, null, select_, text) { queryOpt_ = queryOpt_ };
         }
 
         public override BindContext Bind(BindContext parent) => insert_.Bind(parent);
         public override LogicNode CreatePlan()
         {
-            queryOpt_.optimize_.use_memo_ = false;
             return insert_.CreatePlan();
         }
         public override LogicNode SubstitutionOptimize()
@@ -248,5 +257,7 @@ namespace qpmodel.dml
             physicPlan_ = insert_.physicPlan_;
             return logicPlan_;
         }
+        public override SelectStmt ExtractSelect() => select_;
+        public override PhysicNode InstallSelectPlan(PhysicNode select) => InstallUnder<PhysicInsert>(select);
     }
 }

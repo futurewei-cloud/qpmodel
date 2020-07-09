@@ -116,20 +116,21 @@ namespace qpmodel.expr
 
             switch (func)
             {
-                case "sum": r = new AggSum(args[0]); break;
-                case "min": r = new AggMin(args[0]); break;
-                case "max": r = new AggMax(args[0]); break;
-                case "avg": r = new AggAvg(args[0]); break;
-                case "stddev_samp": r = new AggStddevSamp(args[0]); break;
+                case "sum": r = new AggSum(args); break;
+                case "min": r = new AggMin(args); break;
+                case "max": r = new AggMax(args); break;
+                case "avg": r = new AggAvg(args); break;
+                case "stddev_samp": r = new AggStddevSamp(args); break;
                 case "count":
                     if (args.Count == 0)
                         r = new AggCountStar(null);
                     else
-                        r = new AggCount(args[0]);
+                        r = new AggCount(args);
                     break;
                 case "substr": case "substring": r = new SubstringFunc(args); break;
                 case "upper": r = new UpperFunc(args); break;
                 case "year": r = new YearFunc(args); break;
+                case "date": r = new DateFunc(args); break;
                 case "repeat": r = new RepeatFunc(args); break;
                 case "abs": r = new AbsFunc(args); break;
                 case "round": r = new RoundFunc(args); break;
@@ -149,7 +150,8 @@ namespace qpmodel.expr
             }
 
             // verify arguments count
-            Utils.Checks(args.Count == r.argcnt_, $"{r.argcnt_} argument is expected");
+            if (args.Count != r.argcnt_)
+                throw new SemanticAnalyzeException($"{r.argcnt_} argument is expected");
             return r;
         }
 
@@ -203,7 +205,6 @@ namespace qpmodel.expr
                 case 0: return fncode();
                 case 1: return fncode(args[0]);
                 case 2: return fncode(args[0], args[1]);
-                case 3: return fncode(args[0], args[1], args[2]);
                 default:
                     throw new NotImplementedException();
             }
@@ -235,6 +236,7 @@ namespace qpmodel.expr
             return str.Substring(start, Math.Min(end - start + 1, str.Length));
         }
     }
+
     public class UpperFunc : FuncExpr
     {
         public UpperFunc(List<Expr> args) : base("upper", args)
@@ -343,7 +345,7 @@ namespace qpmodel.expr
         public override void Bind(BindContext context)
         {
             base.Bind(context);
-            type_ = args_()[0].type_;
+            type_ = args_()[1].type_;
         }
 
         public override Value Exec(ExecContext context, Row input)
@@ -428,7 +430,7 @@ namespace qpmodel.expr
     {
         // Exec info
         internal Value sum_;
-        public AggSum(Expr arg) : base("sum", new List<Expr> { arg }) { }
+        public AggSum(List<Expr> args) : base("sum", args) { }
 
         public override Value Init(ExecContext context, Row input)
         {
@@ -459,7 +461,7 @@ namespace qpmodel.expr
     {
         // Exec info
         internal long count_;
-        public AggCount(Expr arg) : base("count", new List<Expr> { arg }) { }
+        public AggCount(List<Expr> args) : base("count", args) { }
 
         public override void Bind(BindContext context)
         {
@@ -487,7 +489,11 @@ namespace qpmodel.expr
     {
         // Exec info
         internal long count_;
-        public AggCountStar(Expr arg) : base("count(*)", new List<Expr> { new LiteralExpr("0", new IntType()) }) { argcnt_ = 0; }
+        public AggCountStar(List<Expr> args) : base("count(*)", new List<Expr> { new LiteralExpr("0", new IntType()) })
+        {
+            Debug.Assert(args is null);
+            argcnt_ = 0;
+        }
 
         public override void Bind(BindContext context)
         {
@@ -511,7 +517,7 @@ namespace qpmodel.expr
     {
         // Exec info
         Value min_;
-        public AggMin(Expr arg) : base("min", new List<Expr> { arg }) { }
+        public AggMin(List<Expr> args) : base("min", args) { }
         public override Value Init(ExecContext context, Row input)
         {
             min_ = args_()[0].Exec(context, input);
@@ -542,7 +548,7 @@ namespace qpmodel.expr
     {
         // Exec info
         Value max_;
-        public AggMax(Expr arg) : base("max", new List<Expr> { arg }) { }
+        public AggMax(List<Expr> args) : base("max", args) { }
         public override Value Init(ExecContext context, Row input)
         {
             max_ = arg_().Exec(context, input);
@@ -592,7 +598,7 @@ namespace qpmodel.expr
         }
         AvgPair pair_;
 
-        public AggAvg(Expr arg) : base("avg", new List<Expr> { arg }) { }
+        public AggAvg(List<Expr> args) : base("avg", args) { }
 
         public override Value Init(ExecContext context, Row input)
         {
@@ -648,12 +654,12 @@ namespace qpmodel.expr
                     int n = vals_.Count;
                     if (n != 1)
                     {
-                        dynamic sum = 0.0; vals_.ForEach(x => sum += x is null? 0: x);
+                        dynamic sum = 0.0; vals_.ForEach(x => sum += x is null ? 0 : x);
                         if (sum != null)
                         {
                             var mean = sum / n;
-                            dynamic stddev = 0; vals_.ForEach(x => stddev +=  
-                                            x is null? 0: ((x - mean) * (x - mean)));
+                            dynamic stddev = 0; vals_.ForEach(x => stddev +=
+                                            x is null ? 0 : ((x - mean) * (x - mean)));
                             if (stddev != null)
                             {
                                 stddev = Math.Sqrt(stddev / (n - 1));
@@ -670,7 +676,7 @@ namespace qpmodel.expr
         }
         AggStddevValues values_;
 
-        public AggStddevSamp(Expr arg) : base("stddev_samp", new List<Expr> { arg }) { }
+        public AggStddevSamp(List<Expr> args) : base("stddev_samp", args) { }
 
         public override Value Init(ExecContext context, Row input)
         {
@@ -737,7 +743,6 @@ namespace qpmodel.expr
             if (else_() != null)
                 Debug.Assert(type_.Compatible(else_().type_));
         }
-
 
         public override int GetHashCode() => base.GetHashCode();
 
@@ -810,7 +815,6 @@ namespace qpmodel.expr
             }
         }
     }
-
 
     // we can actually put all binary ops in BinExpr class but we want to keep 
     // some special ones (say AND/OR) so we can coding easier
@@ -918,10 +922,11 @@ namespace qpmodel.expr
 
         public override Value Exec(ExecContext context, Row input)
         {
+            string[] nullops = { "is", "||" };
             dynamic lv = l_().Exec(context, input);
             dynamic rv = r_().Exec(context, input);
 
-            if (op_ != "is" && (lv is null || rv is null))
+            if (!nullops.Contains(op_) && (lv is null || rv is null))
                 return null;
 
             switch (op_)
@@ -940,10 +945,10 @@ namespace qpmodel.expr
                 case "*": return lv * rv;
                 case "/": return lv / rv;
                 case "||": return string.Concat(lv, rv);
-                case ">": return lv > rv;
-                case ">=": return lv >= rv;
-                case "<": return lv < rv;
-                case "<=": return lv <= rv;
+                case ">": return Compare(lv, rv) > 0;
+                case ">=": return Compare(lv, rv) >= 0;
+                case "<": return Compare(lv, rv) < 0;
+                case "<=": return Compare(lv, rv) <= 0;
                 case "=": return lv == rv;
                 case "<>": case "!=": return lv != rv;
                 case "like": return Utils.StringLike(lv, rv);
@@ -957,6 +962,13 @@ namespace qpmodel.expr
                 default:
                     throw new NotImplementedException();
             }
+        }
+        int Compare(dynamic lv, dynamic rv)
+        {
+            if (lv is string && rv is string)
+                return lv.CompareTo(rv);
+            else
+                return lv == rv ? 0 : lv < rv ? -1 : 1;
         }
 
         public override string ExecCode(ExecContext context, string input)

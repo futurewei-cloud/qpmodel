@@ -79,7 +79,7 @@ namespace qpmodel.stat
         public int nbuckets_ { get; set; }
         public Value[] buckets_ { get; set; } = new Value[NBuckets_ + 1];
 
-        int whichBucket(Value val)
+        int whichBucketLargerThan(Value val)
         {
             dynamic value = val;
 
@@ -94,6 +94,9 @@ namespace qpmodel.stat
             }
             return nbuckets_ + 1;
         }
+
+        // given upper bound @ub and lower bound @lb, calculate the position of @val
+        //
         double getFraction(Value lb, Value ub, Value val)
         {
             // string is not capable of comparing
@@ -106,14 +109,15 @@ namespace qpmodel.stat
             Debug.Assert(frac >= 0 && frac < 1.0 + StatConst.epsilon_);
             return frac;
         }
+
         public double? EstSelectivity(string op, Value val)
         {
             // return the selectivity respect to only the histogram
             double selectivity = StatConst.one_;
             Debug.Assert(new List<String>() { ">", ">=", "<", "<=" }.Contains(op));
 
-            int which = whichBucket(val);
-            
+            int which = whichBucketLargerThan(val);
+
             switch (op)
             {
                 case ">":
@@ -121,16 +125,28 @@ namespace qpmodel.stat
                     if (which == 0) selectivity = 1.0;
                     else if (which == nbuckets_ + 1) selectivity = 0.0;
                     else
-                        selectivity = (1.0 * (nbuckets_ - which) 
-                            + 1.0 - getFraction(buckets_[which - 1], buckets_[which], val)) / nbuckets_;
+                    {
+                        var basefraction = nbuckets_ - which;
+                        var deltadjust = 0.0;
+                        // for non-string data, we can further adjust within the bucket fraction by assuming
+                        // data are continuous within the bucket
+                        if (!(val is string))
+                            deltadjust = 1.0 - getFraction(buckets_[which - 1], buckets_[which], val);
+                        selectivity = (basefraction + deltadjust) / nbuckets_;
+                    }
                     break;
                 case "<":
                 case "<=":
                     if (which == 0) selectivity = 0.0;
                     else if (which == nbuckets_ + 1) selectivity = 1.0;
                     else
-                        selectivity = (1.0 * which - 1 + getFraction(buckets_[which - 1], buckets_[which], val))
-                            / nbuckets_;
+                    {
+                        var basefraction = which;
+                        var deltadjust = 0.0;
+                        if (!(val is string))
+                            deltadjust = 1.0 - getFraction(buckets_[which - 1], buckets_[which], val);
+                        selectivity = (basefraction - deltadjust) / nbuckets_;
+                    }
                     break;
             }
 
@@ -157,10 +173,16 @@ namespace qpmodel.stat
             Debug.Assert(total <= 1 + StatConst.epsilon_);
             Debug.Assert(totalfreq_ <= 1 + StatConst.epsilon_);
         }
-        int whichValue(Value val)
-            => Array.IndexOf(values_, val);
+
         double calcTotalFreq(Value val, string op)
         {
+            int compare(dynamic v1, dynamic v2)
+            {
+                if (v1 is string && v2 is string)
+                    return v1.CompareTo(v2);
+                return v1 == v2 ? 0 : v1 < v2 ? -1 : 1;
+            }
+
             double totfreq = 0.0;
             dynamic value = val;
             for (int i = 0; i < NValues_; i++)
@@ -168,33 +190,40 @@ namespace qpmodel.stat
                 switch (op)
                 {
                     case "<=":
-                        if (((dynamic)values_[i]) <= value) totfreq += freqs_[i];
+                        if (compare(values_[i], value) <= 0) totfreq += freqs_[i];
                         break;
                     case "<":
-                        if (((dynamic)values_[i]) < value) totfreq += freqs_[i];
+                        if (compare(values_[i], value) < 0) totfreq += freqs_[i];
                         break;
                     case ">=":
-                        if (((dynamic)values_[i]) >= value) totfreq += freqs_[i];
+                        if (compare(values_[i], value) >= 0) totfreq += freqs_[i];
                         break;
                     case ">":
-                        if (((dynamic)values_[i]) > value) totfreq += freqs_[i];
+                        if (compare(values_[i], value) > 0) totfreq += freqs_[i];
                         break;
+                    default:
+                        throw new NotImplementedException();
                 }
             }
+
             return totfreq;
         }
+
         public double? EstSelectivity(string op, Value val)
         {
+            int whichValue(Value val)
+                => Array.IndexOf(values_, val);
+
             if (!new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(op))
                 return null;
-            
+
             if (op == "=")
             {
                 int which = whichValue(val);
                 if (which == -1) return otherfreq_;
                 return freqs_[which];
             }
-            
+
             double selectivity = calcTotalFreq(val, op);
             Estimator.validateSelectivity(selectivity);
 
@@ -227,10 +256,10 @@ namespace qpmodel.stat
             foreach (var r in samples)
             {
                 Value val = r[index];
-                if (val is null) 
+                if (val is null)
                 {
                     nNulls++;
-					continue;
+                    continue;
                 }
 
                 values.Add(val);
@@ -242,11 +271,11 @@ namespace qpmodel.stat
             {
                 mcv_ = new MCVList();
                 var groups = from value in values group value by value into newGroup select newGroup;
-                
+
                 Dictionary<Value, int> sortgroup = new Dictionary<Value, int>();
                 foreach (var g in groups)
                     sortgroup.Add(g.Key, g.Count());
-                
+
                 var sorted = from pair in sortgroup orderby pair.Value descending select pair;
                 mcv_.nvalues_ = (int)Math.Min(n_distinct_, MCVList.NValues_);
 
@@ -254,7 +283,7 @@ namespace qpmodel.stat
                 double freq = 0.0;
                 foreach (var g in sorted)
                 {
-                    mcv_.values_[i] = g.Key ;
+                    mcv_.values_[i] = g.Key;
                     mcv_.freqs_[i] = (1.0 * g.Value) / values.Count();
                     freq += mcv_.freqs_[i];
                     i++;
@@ -322,28 +351,48 @@ namespace qpmodel.stat
 
         public double EstSelectivity(string op, Value val)
         {
+            var selectivity = StatConst.one_;
             if (op == "like")
-                return EstLikeSelectivity(val);
-            if (!new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(op))
-                return StatConst.one_;
-
-            if (mcv_ is null) 
-            {
-                if (hist_ is null)
-                    return StatConst.one_;
-                if (op == "=") // unique
-                    return 1.0 / n_rows_;
-                else
-                    return hist_.EstSelectivity(op, val) ?? StatConst.one_;
-            }
+                selectivity = EstLikeSelectivity(val);
+            else if (!new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(op))
+                selectivity = StatConst.one_;
             else
             {
-                if (op == "=")
-                    return mcv_.EstSelectivity(op, val) ?? StatConst.one_;
+                if (mcv_ is null)
+                {
+                    if (hist_ is null)
+                        selectivity = StatConst.one_;
+                    else if (op == "=") // unique
+                        selectivity = 1.0 / n_rows_;
+                    else
+                        selectivity = hist_.EstSelectivity(op, val) ?? StatConst.one_;
+                }
                 else
-                    return (mcv_.EstSelectivity(op, val) ?? StatConst.one_)
-                        + (1 - mcv_.totalfreq_) * (hist_?.EstSelectivity(op, val) ?? StatConst.one_);
+                {
+                    if (op == "=")
+                        selectivity = mcv_.EstSelectivity(op, val) ?? StatConst.one_;
+                    else
+                    {
+                        var mcvest = mcv_.EstSelectivity(op, val);
+                        var histest = hist_?.EstSelectivity(op, val);
+                        if (mcvest is null)
+                        {
+                            // only use histgram if avaliable
+                            selectivity = hist_ is null ? StatConst.one_ : (histest ?? StatConst.one_);
+                        }
+                        else
+                        {
+                            if (histest is null)
+                                selectivity = (double)mcvest;
+                            else
+                                selectivity = (double)mcvest + ((1 - mcv_.totalfreq_) * ((double)histest));
+                        }
+                    }
+                }
             }
+
+            Estimator.validateSelectivity(selectivity);
+            return selectivity;
         }
         public ulong EstDistinct()
         {
@@ -372,11 +421,11 @@ namespace qpmodel.stat
                     {
                         // a.a1 >= <const>
                         var stat = Catalog.sysstat_.GetColumnStat(bpl.relname_, pl.colName_);
-                        return stat.EstSelectivity(pred.op_, pr.val_);
+                        selectivity = stat.EstSelectivity(pred.op_, pr.val_);
                     }
                 }
             }
-            if (filter is InListExpr inPred)
+            else if (filter is InListExpr inPred)
             {
                 // implementation of IN estimation
                 if (inPred.children_[0] is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
@@ -388,9 +437,11 @@ namespace qpmodel.stat
                         if (inPred.children_[i] is LiteralExpr pr)
                             selectivity += stat.EstSelectivity("=", pr.val_);
                     }
-                    return Math.Min(1.0, selectivity);
+                    selectivity = Math.Min(1.0, selectivity);
                 }
             }
+
+            validateSelectivity(selectivity);
             return selectivity;
         }
 
@@ -443,13 +494,13 @@ namespace qpmodel.stat
                     else
                     {
                         double vsel = EstSelectivity(v);
-                        selectivity = filter is LogicAndExpr ? selectivity * vsel : selectivity + vsel - vsel * selectivity;
+                        selectivity = filter is LogicAndExpr ? (selectivity * vsel) : selectivity + vsel - (vsel * selectivity);
                     }
                 }
                 foreach (var colexpr in colselcombine)
                 {
                     double csel = EstColumnSelectivity(colexpr.Value, filter is LogicAndExpr);
-                    selectivity = filter is LogicAndExpr ? selectivity * csel : selectivity + csel - csel * selectivity;
+                    selectivity = filter is LogicAndExpr ? (selectivity * csel) : selectivity + csel - (csel * selectivity);
                 }
             }
 
@@ -477,7 +528,6 @@ namespace qpmodel.stat
                 records_[tabcol] = stat;
         }
 
-
         public ColumnStat GetColumnStat(string tabName, string colName)
         {
             return RetrieveColumnStat(tabName + colName);
@@ -489,7 +539,6 @@ namespace qpmodel.stat
                 return value;
             return null;
         }
-
 
         public List<ColumnStat> GetOrCreateTableStats(string tabName)
         {
@@ -564,19 +613,19 @@ namespace qpmodel.stat
 
         public void jsonPostProcess(ColumnStat stat)
         {
-
             if (stat.hist_ != null)
             {
                 for (int i = 0; i < stat.hist_.buckets_.Length; i++)
                 {
-                    stat.hist_.buckets_[i] = ExtractValue((JsonElement)stat.hist_.buckets_[i]);
+                    if (stat.hist_.buckets_[i] != null)
+                        stat.hist_.buckets_[i] = ExtractValue((JsonElement)stat.hist_.buckets_[i]);
                 }
             }
 
             if (stat.mcv_ != null && stat.mcv_.nvalues_ != 0)
             {
                 int i = 0;
-                while (stat.mcv_.values_[i] != null)
+                while ((i < stat.mcv_.nvalues_) && (stat.mcv_.values_[i] != null))
                 {
                     stat.mcv_.values_[i] = ExtractValue((JsonElement)stat.mcv_.values_[i]);
                     i++;
@@ -612,7 +661,6 @@ namespace qpmodel.stat
 
     public class LogicAnalyze : LogicNode
     {
-
         public LogicAnalyze(LogicNode child) => children_.Add(child);
 
         public BaseTableRef GetTargetTable()
@@ -621,7 +669,7 @@ namespace qpmodel.stat
             var child = child_();
 
             Debug.Assert(child is LogicGather ||
-                         child is LogicScanTable  ||
+                         child is LogicScanTable ||
                          child is LogicSampleScan);
 
             if (child is LogicGather || child is LogicSampleScan)
@@ -636,12 +684,11 @@ namespace qpmodel.stat
 
         public PhysicAnalyze(LogicAnalyze logic, PhysicNode l) : base(logic) => children_.Add(l);
 
-        public override string Open(ExecContext context)
+        public override void Open(ExecContext context)
         {
             base.Open(context);
             var tabName = (logic_ as LogicAnalyze).GetTargetTable().relname_;
             stats_ = Catalog.sysstat_.GetOrCreateTableStats(tabName);
-            return null;
         }
 
         public override string Exec(Func<Row, string> callback)

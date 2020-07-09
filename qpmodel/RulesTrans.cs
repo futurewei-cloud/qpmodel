@@ -38,7 +38,7 @@ using qpmodel.utils;
 
 namespace qpmodel.optimizer
 {
-    public class Rule
+    public abstract class Rule
     {
         public static List<Rule> ruleset_ = new List<Rule>() {
             new JoinAssociativeRule(),
@@ -49,6 +49,7 @@ namespace qpmodel.optimizer
             new Join2SingleJoin(),
             new Scan2Scan(),
             new Scan2IndexSeek(),
+            new ScanFile2ScanFile(),
             new Filter2Filter(),
             new Agg2HashAgg(),
             new Order2Sort(),
@@ -78,11 +79,11 @@ namespace qpmodel.optimizer
                 ruleset_.RemoveAll(x => x is Join2NLJoin);
         }
 
-        public virtual bool Appliable(CGroupMember expr) => false;
-        public virtual CGroupMember Apply(CGroupMember expr) => null;
+        public abstract bool Appliable(CGroupMember expr);
+        public abstract CGroupMember Apply(CGroupMember expr);
     }
 
-    public class ExplorationRule : Rule { }
+    public abstract class ExplorationRule : Rule { }
 
     // There are two join exploration rules are used:
     //  1. Join commutative rule: AB => BA
@@ -95,7 +96,6 @@ namespace qpmodel.optimizer
     //
     public class JoinCommutativeRule : ExplorationRule
     {
-
         public override bool Appliable(CGroupMember expr)
         {
             return expr.logic_ is LogicJoin lj && lj.IsInnerJoin();
@@ -130,35 +130,6 @@ namespace qpmodel.optimizer
     //
     public class JoinAssociativeRule : ExplorationRule
     {
-        // Extract filter matching ABC's tablerefs
-        // ABC=[a,b]
-        //  a.i=b.i AND a.j=b.j AND a.k+b.k=c.k => a.i=b.i AND a.j=b.j
-        // ABC=[a,b,c]
-        //   a.i=b.i AND a.j=b.j AND a.k+b.k=c.k => a.k+b.k=c.k
-        Expr exactFilter(Expr fullfilter, List<LogicNode> ABC)
-        {
-            Expr ret = null;
-            if (fullfilter is null)
-                return null;
-
-            List<TableRef> ABCtabrefs = new List<TableRef>();
-            foreach (var m in ABC)
-                ABCtabrefs.AddRange(m.InclusiveTableRefs());
-
-            var andlist = fullfilter.FilterToAndList();
-            foreach (var v in andlist)
-            {
-                var predicate = v as BinExpr;
-                var predicateRefs = predicate.tableRefs_;
-                if (ABCtabrefs.ListAEqualsB(predicateRefs))
-                {
-                    ret = ret.AddAndFilter(predicate);
-                }
-            }
-
-            return ret;
-        }
-
         public override bool Appliable(CGroupMember expr)
         {
             LogicJoin a_bc = expr.logic_ as LogicJoin;
@@ -219,7 +190,6 @@ namespace qpmodel.optimizer
                         return expr;
                 }
             }
-
 
             return new CGroupMember(ab_c, expr.group_);
         }

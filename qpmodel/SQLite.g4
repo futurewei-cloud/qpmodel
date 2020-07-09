@@ -30,7 +30,7 @@
  */
  
  /*
-  * Further simplified and modified and simplified by moi
+  * Further simplified and modified by moi
   */
 grammar SQLite;
 
@@ -171,7 +171,6 @@ expr
  | expr op=( '*' | '/' | '%' ) expr							#arithtimesexpr
  | expr op=( PLUS | MINUS ) expr							#arithplusexpr
  | expr op=( '<<' | '>>' | '&' | '|' ) expr					#arithbitexpr
- | expr op=( '||' | '||' ) expr							    #stringopexpr
  | expr op=( '<' | '<=' | '>' | '>=' ) expr					#arithcompexpr																		
  | expr K_NOT? K_BETWEEN '(' expr ',' expr ')'				#BetweenExpr
  | expr K_IS K_NOT? expr									#IsExpr
