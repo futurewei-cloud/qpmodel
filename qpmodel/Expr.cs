@@ -35,7 +35,6 @@ using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.utils;
 using qpmodel.index;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace qpmodel.expr
 {
@@ -154,6 +153,7 @@ namespace qpmodel.expr
     {
         [ThreadStatic]
         public static Dictionary<string, Expr> table_ = new Dictionary<string, Expr>();
+        public static void Reset() => table_.Clear();
 
         public static Expr Locate(string objectid) => table_[objectid];
     }
@@ -211,11 +211,18 @@ namespace qpmodel.expr
         public static List<TableRef> CollectAllTableRef(this Expr expr, bool includingParameters = true)
         {
             var list = new HashSet<TableRef>();
-            expr.VisitEachT<ColExpr>(x =>
+            if (expr is AggCountStar acs)
             {
-                if (!x.isParameter_ || includingParameters)
-                    list.Add(x.tabRef_);
-            });
+                acs.tableRefs_.ForEach(x => list.Add(x));
+            }
+            else
+            {
+                expr.VisitEachT<ColExpr>(x =>
+                {
+                    if (!x.isParameter_ || includingParameters)
+                        list.Add(x.tabRef_);
+                });
+             }
             return list.ToList();
         }
 
@@ -228,7 +235,7 @@ namespace qpmodel.expr
                 r += "\n";
                 expr.VisitEachT<SubqueryExpr>(x =>
                 {
-                    string cached = x.IsCacheable() ? "cached " : "";
+                    string cached = x.isCacheable_ ? "cached " : "";
                     r += Utils.Spaces(depth + 2) + $"<{x.GetType().Name}> {cached}{x.subqueryid_}\n";
                     Debug.Assert(x.query_.bindContext_ != null);
                     if (x.query_.physicPlan_ != null)
@@ -257,24 +264,6 @@ namespace qpmodel.expr
         {
             Debug.Assert(expr.type_ != null);
             return expr.type_ is BoolType;
-        }
-
-        public static Expr ConstFolding(this Expr expr)
-        {
-            Debug.Assert(expr.bounded_);
-            bool IsConstFn(Expr e) => !(e is LiteralExpr) && e.IsConst();
-            Expr EvalConstFn(Expr e)
-            {
-                var isconst = e.TryEvalConst(out Value val);
-                Debug.Assert(isconst);
-                var newe = LiteralExpr.MakeLiteral(val, expr.type_, expr.outputName_);
-                return newe;
-            }
-
-            if (expr is LiteralExpr)
-                return expr;
-            else
-                return expr.SearchAndReplace<Expr>(IsConstFn, EvalConstFn);
         }
     }
 
@@ -320,7 +309,7 @@ namespace qpmodel.expr
             {
                 var andexpr = LogicAndExpr.MakeExpr(andlist[0], andlist[1]);
                 for (int i = 2; i < andlist.Count; i++)
-                    andexpr.children_[0] = LogicAndExpr.MakeExpr(andexpr.l_(), andlist[i]);
+                    andexpr.children_[0] = LogicAndExpr.MakeExpr(andexpr.lchild_(), andlist[i]);
                 return andexpr;
             }
         }
@@ -341,7 +330,7 @@ namespace qpmodel.expr
             // and we leave the vacuum job to filter push down
             //
             if (node is LogicFilter)
-                node.filter_ = LiteralExpr.MakeLiteralBool(true);
+                node.filter_ = ConstExpr.MakeConstBool(true);
         }
 
         public static bool FilterIsConst(this Expr filter, out bool trueOrfalse)
@@ -406,8 +395,8 @@ namespace qpmodel.expr
                     //
                     if (filter.TableRefsContainedBy(nodejoinIncl))
                     {
-                        if (!nodeJoin.l_().PushJoinFilter(filter) &&
-                            !nodeJoin.r_().PushJoinFilter(filter))
+                        if (!nodeJoin.lchild_().PushJoinFilter(filter) &&
+                            !nodeJoin.rchild_().PushJoinFilter(filter))
                             return nodeJoin.AddFilter(filter);
                         else
                             return true;
@@ -428,8 +417,8 @@ namespace qpmodel.expr
             if (filter is BinExpr fb)
             {
                 // expression is already normalized, so no swap side shall considered
-                Debug.Assert(!(fb.l_() is LiteralExpr && fb.r_() is ColExpr));
-                if (indexops.Contains(fb.op_) && fb.l_() is ColExpr cl && fb.r_() is LiteralExpr)
+                Debug.Assert(!(fb.lchild_() is ConstExpr && fb.rchild_() is ColExpr));
+                if (indexops.Contains(fb.op_) && fb.lchild_() is ColExpr cl && fb.rchild_() is ConstExpr)
                 {
                     var index = table.Table().IndexContains(cl.colName_);
                     if (index != null)
@@ -450,7 +439,7 @@ namespace qpmodel.expr
 
             filter.VisitEachT<BinExpr>(x =>
             {
-                if (x.IsBoolean() && x.l_() is LiteralExpr)
+                if (x.IsBoolean() && x.lchild_() is ConstExpr)
                     x.SwapSide();
             });
             return filter;
@@ -470,8 +459,8 @@ namespace qpmodel.expr
             {
                 if (filter is BinExpr bf && bf.op_.Equals("="))
                 {
-                    var ltabrefs = bf.l_().tableRefs_;
-                    var rtabrefs = bf.r_().tableRefs_;
+                    var ltabrefs = bf.lchild_().tableRefs_;
+                    var rtabrefs = bf.rchild_().tableRefs_;
                     // TODO: a.i+b.i=0 => a.i=-b.i
                     return ltabrefs.Count > 0 && rtabrefs.Count > 0;
                 }
@@ -552,7 +541,7 @@ namespace qpmodel.expr
     //     subclass shall only use children_ to contain Expr, otherwise
     //      Bind() etc won't work.
     //
-    public class Expr : TreeNode<Expr>
+    public partial class Expr : TreeNode<Expr>
     {
         // Expression in selection list can have an output name 
         // e.g, a.i+b.i [[as] total]
@@ -584,7 +573,8 @@ namespace qpmodel.expr
 
         // output type of the expression
         internal ColumnType type_;
-
+        // to help prevent too much recursion.
+        internal bool normalized_ = false;
         protected string outputName() => outputName_ != null ? $"(as {outputName_})" : null;
 
         void validateAfterBound()
@@ -599,17 +589,6 @@ namespace qpmodel.expr
 
         public void VisitEachIgnoreRef<T>(Action<T> callback) where T : Expr
             => VisitEachIgnore<ExprRef, T>(callback);
-
-        public void VisitEachIgnore<T1, T2>(Action<T2> callback) where T1 : Expr where T2 : Expr
-        {
-            if (!(this is T1))
-            {
-                if (this is T2)
-                    callback(this as T2);
-                foreach (var v in children_)
-                    v.VisitEachIgnore<T1, T2>(callback);
-            }
-        }
 
         public bool HasSubQuery() => VisitEachExists(e => e is SubqueryExpr);
         public bool HasAggFunc() => VisitEachExists(e => e is AggFunc);
@@ -722,16 +701,25 @@ namespace qpmodel.expr
             return object.Equals(_, n._) && tableRefs_.SequenceEqual(n.tableRefs_) &&
                 children_.SequenceEqual(n.children_);
         }
+        public bool IDEquals(object obj)
+        {
+            if (!(obj is Expr))
+                return false;
+            return object.Equals(_, (obj as Expr)._);
+        }
 
         public List<TableRef> ResetAggregateTableRefs()
         {
-            if (children_.Count > 0)
+            if (children_.Count > 0 && !(this is AggCountStar))
             {
                 tableRefs_.Clear();
                 children_.ForEach(x =>
                 {
-                    Debug.Assert(x.bounded_);
-                    tableRefs_.AddRange(x.ResetAggregateTableRefs());
+                    if (!(x is AggCountStar))
+                    {
+                        Debug.Assert(x.bounded_);
+                        tableRefs_.AddRange(x.ResetAggregateTableRefs());
+                    }
                 });
                 if (tableRefs_.Count > 1)
                     tableRefs_ = tableRefs_.Distinct().ToList();
@@ -749,6 +737,11 @@ namespace qpmodel.expr
             // register the expression in the search table
             ExprSearch.table_.Add(_, this);
         }
+        internal void dummyBind()
+        {
+            markBounded();
+            type_ = new BoolType();
+        }
 
         public virtual void Bind(BindContext context)
         {
@@ -757,12 +750,44 @@ namespace qpmodel.expr
                 Expr x = children_[i];
 
                 x.Bind(context);
-                x = x.ConstFolding();
                 children_[i] = x;
             }
             ResetAggregateTableRefs();
 
             markBounded();
+        }
+
+        public virtual Expr BindAndNormalize(BindContext context)
+        {
+            Bind(context);
+            return Normalize();
+        }
+
+        internal Expr NormalizeClause(Expr clause)
+        {
+            Expr x = clause.Normalize();
+            if (x is null || (x is ConstExpr ce && (ce.val_ is null || ce.IsFalse())))
+            {
+                // Normalization eliminated a clause which is always FALSE
+                return ConstExpr.MakeConstBool(false);
+            }
+            else
+            if (!(x is null) && x is ConstExpr ce2 && !(ce2.val_ is null) && ce2.IsTrue())
+            {
+                // eliminate always true clause.
+                return ConstExpr.MakeConstBool(true);
+            }
+            else
+            {
+                return x;
+            }
+        }
+
+        public virtual Expr BindAndNormalizeClause(BindContext context)
+        {
+            Bind(context);
+
+            return NormalizeClause(this);
         }
 
         public Expr DeQueryRef()
@@ -855,9 +880,22 @@ namespace qpmodel.expr
 
         // -- execution section --
 
-        public ColExpr(string dbName, string tabName, string colName, ColumnType type) : base()
+        public ColExpr(string dbName, string tabName, string colName, ColumnType type, int ordinal = -1) : base()
         {
-            dbName_ = dbName; tabName_ = tabName; colName_ = colName; outputName_ = colName; type_ = type;
+            if (dbName != null)
+            {
+                dbName_ = Utils.normalizeName(dbName);
+            }
+
+            if (tabName != null)
+            {
+                tabName_ = Utils.normalizeName(tabName);
+            }
+
+            colName_ = Utils.normalizeName(colName);
+            outputName_ = colName_;
+            type_ = type;
+            ordinal_ = ordinal;
             Debug.Assert(Clone().Equals(this));
         }
 
@@ -894,6 +932,21 @@ namespace qpmodel.expr
 
         public override void Bind(BindContext context)
         {
+            /*
+             * There are a few cases when bind is called twice
+             * on the same node, the known case is
+             * select a1 from a order by -a1
+             * first a1 in the select gets bound, then order by
+             * pre-processing replaces -a1 with a reference to bounded
+             * a1 with unary minus. When trying to bind order by the bound node
+             * triggers the assertion tabRef is null.
+             * To avoid this, return if already bound. If it turns out that
+             * too many times bind is called on the same node, find the real
+             * root cause, fix it, and remove this guard.
+             */
+            if (bounded_)
+                return;
+
             Debug.Assert(IsLeaf());
             Debug.Assert(tabRef_ is null);
             Debug.Assert(tabName_ == tableName_());
@@ -956,6 +1009,8 @@ namespace qpmodel.expr
         {
             if (obj is ColExpr co)
             {
+                if (co._ == this._)
+                    return true;
                 if (co.tableName_() is null)
                     return tableName_() is null && co.colName_.Equals(colName_);
                 else
@@ -995,6 +1050,14 @@ namespace qpmodel.expr
                 return base.ExecCode(context, input);
             else
                 return $"{input}[{ordinal_}]";
+        }
+
+        public override Expr Clone()
+        {
+            ColExpr nce = base.Clone() as ColExpr;
+            nce.ordinal_ = this.ordinal_;
+
+            return nce;
         }
     }
 
@@ -1047,8 +1110,12 @@ namespace qpmodel.expr
             query_ = query as SelectStmt;
             Debug.Assert(!query_.isCteDefinition_);
             query_.isCteDefinition_ = true;
-            cteName_ = cteName;
+            cteName_ = Utils.normalizeName(cteName);
             colNames_ = colNames;
+            for (int i = 0; i < colNames_.Count; ++i)
+            {
+                colNames_[i] = Utils.normalizeName(colNames_[i]);
+            }
             refcnt_ = 0;
         }
 
@@ -1073,12 +1140,12 @@ namespace qpmodel.expr
         }
     }
 
-    public class LiteralExpr : Expr
+    public class ConstExpr : Expr
     {
         internal string str_;
         internal Value val_;
 
-        public LiteralExpr(string str, ColumnType type) : base()
+        public ConstExpr(string str, ColumnType type) : base()
         {
             str_ = str;
             type_ = type;
@@ -1093,20 +1160,25 @@ namespace qpmodel.expr
                 switch (type)
                 {
                     case IntType it:
-                        if (int.TryParse(str, out int value))
+                        if (int.TryParse(str, out var value))
                             val_ = value;
                         else
                             throw new SemanticAnalyzeException("wrong integer format");
                         break;
                     case DoubleType dt:
-                        if (double.TryParse(str, out double valued))
+                        if (double.TryParse(str, out var valued))
                             val_ = valued;
                         else
                             throw new SemanticAnalyzeException("wrong double precision format");
                         break;
+
+                    case NumericType nt:
+                        val_ = Convert.ToDecimal(str);
+                        break;
+
                     case DateTimeType dtt:
                         var datestr = str.RemoveStringQuotes();
-                        if (DateTime.TryParse(datestr, out DateTime valuedt))
+                        if (DateTime.TryParse(datestr, out var valuedt))
                             val_ = valuedt;
                         else
                             throw new SemanticAnalyzeException("wrong datetime format");
@@ -1131,7 +1203,7 @@ namespace qpmodel.expr
             Debug.Assert(val_ != null || type_ is AnyType);
         }
 
-        public LiteralExpr(string interval, string unit)
+        public ConstExpr(string interval, string unit)
         {
             int day = 0;
             interval = interval.RemoveStringQuotes();
@@ -1196,7 +1268,7 @@ namespace qpmodel.expr
         public override int GetHashCode() => str_.GetHashCode();
         public override bool Equals(object obj)
         {
-            if (obj is LiteralExpr lo)
+            if (obj is ConstExpr lo)
             {
                 return str_.Equals(lo.str_);
             }
@@ -1206,20 +1278,44 @@ namespace qpmodel.expr
         // give @val and perform the necessary type conversion
         // 8.1, int => 8
         //
-        public static LiteralExpr MakeLiteral(Value val, ColumnType type, string outputName = null)
+        public static ConstExpr MakeConst(Value val, ColumnType type, string outputName = null)
         {
-            LiteralExpr ret = null;
+            ConstExpr ret = null;
             if (type is CharType || type is VarCharType || type is DateTimeType)
-                ret = new LiteralExpr($"'{val}'", type);
+                ret = new ConstExpr($"'{val}'", type);
             else
-                ret = new LiteralExpr($"{val}", type);
+                ret = new ConstExpr($"{val}", type);
             ret.outputName_ = outputName;
 
             ret.markBounded();
             return ret;
         }
-        public static LiteralExpr MakeLiteralBool(bool istrue) =>
-            istrue ? MakeLiteral("true", new BoolType()) : MakeLiteral("false", new BoolType());
+        public static ConstExpr MakeConstBool(bool istrue) =>
+            istrue ? MakeConst("true", new BoolType()) : MakeConst("false", new BoolType());
+        public bool IsNull() => val_ is null;
+
+        public bool IsZero()
+        {
+            if (!(TypeBase.IsNumberType(type_)))
+                return false;
+
+            if ((type_ is IntType && (int)val_ == 0) || (type_ is DoubleType && (double)val_ == 0.0) || (type_ is NumericType && (Decimal)val_ is 0))
+                return true;          
+            return false;
+        }
+
+        public bool IsOne()
+        {
+            if (!(TypeBase.IsNumberType(type_)))
+                return false;
+
+            if ((type_ is IntType && (int)val_ == 1) || (type_ is DoubleType && (double)val_ == 1.0) || (type_ is NumericType && (Decimal)val_ is 1))
+                return true;
+            return false;
+        }
+
+        public bool IsTrue() => (type_ is BoolType && val_ is true);
+        public bool IsFalse() => (type_ is BoolType && val_ is false);
     }
 
     // Runtime only used to reference an expr as a whole without recomputation
@@ -1245,6 +1341,12 @@ namespace qpmodel.expr
 
             // reuse underlying expression's id
             _ = expr._;
+
+            // AggCountStar has tableRefs_, set our tableRefs_ to that.
+            if (expr is AggCountStar acs)
+            {
+                tableRefs_ = acs.tableRefs_;
+            }
         }
 
         public override int GetHashCode() => expr_().GetHashCode();

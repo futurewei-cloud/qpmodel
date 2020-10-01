@@ -60,8 +60,7 @@ namespace qpmodel.logic
         public MarkerExpr()
         {
             Debug.Assert(Equals(Clone()));
-            type_ = new BoolType();
-            markBounded();
+            dummyBind();
         }
 
         public override Value Exec(ExecContext context, Row input)
@@ -142,7 +141,7 @@ namespace qpmodel.logic
             // make a filter on top of the mark join collecting all filters
             Expr topfilter;
             if (nodeAIsOnMarkJoin)
-                topfilter = nodeAFilter.SearchAndReplace(existExpr, LiteralExpr.MakeLiteralBool(true));
+                topfilter = nodeAFilter.SearchAndReplace(existExpr, ConstExpr.MakeConstBool(true));
             else
                 topfilter = nodeAFilter.SearchAndReplace(existExpr, markerFilter);
             nodeBFilter.DeParameter(nodeA.InclusiveTableRefs());
@@ -222,7 +221,7 @@ namespace qpmodel.logic
             LogicJoin newjoin = singJoinNode;
             if (!singJoinNode.max1rowCheck_)
             {
-                newjoin = new LogicJoin(singJoinNode.l_(), singJoinNode.r_(), singJoinNode.filter_);
+                newjoin = new LogicJoin(singJoinNode.lchild_(), singJoinNode.rchild_(), singJoinNode.filter_);
                 newjoin.type_ = JoinType.Left;
             }
 
@@ -232,8 +231,8 @@ namespace qpmodel.logic
         // D Xs (Filter(T)) => Filter(D Xs T) 
         LogicNode djoinOnRightFilter(LogicSingleJoin singleJoinNode, ScalarSubqueryExpr scalarExpr)
         {
-            var nodeLeft = singleJoinNode.l_();
-            var nodeSubquery = singleJoinNode.r_();
+            var nodeLeft = singleJoinNode.lchild_();
+            var nodeSubquery = singleJoinNode.rchild_();
             var nodeSubqueryFilter = nodeSubquery.filter_;
 
             Debug.Assert(scalarExpr.query_.selection_.Count == 1);
@@ -242,7 +241,7 @@ namespace qpmodel.logic
 
             // nullify nodeA's filter: the rest is push to top filter. However,
             // if nodeA is a Filter|MarkJoin, keep its mark filter.
-            var trueCondition = LiteralExpr.MakeLiteralBool(true);
+            var trueCondition = ConstExpr.MakeConstBool(true);
             var nodeLeftFilter = nodeLeft.filter_;
             if (nodeLeftFilter != null)
             {
@@ -296,8 +295,8 @@ namespace qpmodel.logic
         //
         LogicNode djoinOnRightAggregation(LogicSingleJoin singleJoinNode, ScalarSubqueryExpr scalarExpr)
         {
-            var nodeLeft = singleJoinNode.l_();
-            var aggNode = singleJoinNode.r_() as LogicAgg;
+            var nodeLeft = singleJoinNode.lchild_();
+            var aggNode = singleJoinNode.rchild_() as LogicAgg;
 
             // ?a.j = b.j => b.j
             var listexpr = aggNode.RetrieveCorrelatedFilters();
@@ -309,8 +308,8 @@ namespace qpmodel.logic
                 // if we can't handle, bail out
                 if (bv is null)
                     return nodeLeft;
-                var lbv = bv.l_() as ColExpr;
-                var rbv = bv.r_() as ColExpr;
+                var lbv = bv.lchild_() as ColExpr;
+                var rbv = bv.rchild_() as ColExpr;
                 if (lbv is null || rbv is null)
                     return nodeLeft;
 
@@ -445,7 +444,7 @@ namespace qpmodel.logic
     //
     public class LogicMarkJoin : LogicJoin
     {
-        public override string ToString() => $"{l_()} markX {r_()}";
+        public override string ToString() => $"{lchild_()} markX {rchild_()}";
         public LogicMarkJoin(LogicNode l, LogicNode r) : base(l, r) { type_ = JoinType.Left; }
         public LogicMarkJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { type_ = JoinType.Left; }
 
@@ -458,13 +457,13 @@ namespace qpmodel.logic
     }
     public class LogicMarkSemiJoin : LogicMarkJoin
     {
-        public override string ToString() => $"{l_()} markSemiX {r_()}";
+        public override string ToString() => $"{lchild_()} markSemiX {rchild_()}";
         public LogicMarkSemiJoin(LogicNode l, LogicNode r) : base(l, r) { }
         public LogicMarkSemiJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { }
     }
     public class LogicMarkAntiSemiJoin : LogicMarkJoin
     {
-        public override string ToString() => $"{l_()} markAntisemiX {r_()}";
+        public override string ToString() => $"{lchild_()} markAntisemiX {rchild_()}";
         public LogicMarkAntiSemiJoin(LogicNode l, LogicNode r) : base(l, r) { }
         public LogicMarkAntiSemiJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { }
     }
@@ -475,12 +474,12 @@ namespace qpmodel.logic
         {
             children_.Add(l); children_.Add(r);
         }
-        public override string ToString() => $"PMarkJOIN({l_()},{r_()}: {Cost()})";
+        public override string ToString() => $"PMarkJOIN({lchild_()},{rchild_()}: {Cost()})";
 
         // always the first column
         void fixMarkerValue(Row r, Value value) => r[0] = value;
 
-        public override string Exec(Func<Row, string> callback)
+        public override void Exec(Action<Row> callback)
         {
             ExecContext context = context_;
             var logic = logic_ as LogicMarkJoin;
@@ -490,10 +489,10 @@ namespace qpmodel.logic
 
             Debug.Assert(filter != null);
 
-            l_().Exec(l =>
+            lchild_().Exec(l =>
             {
                 bool foundOneMatch = false;
-                r_().Exec(r =>
+                rchild_().Exec(r =>
                 {
                     if (!foundOneMatch)
                     {
@@ -508,7 +507,6 @@ namespace qpmodel.logic
                             callback(n);
                         }
                     }
-                    return null;
                 });
 
                 // if there is no match, mark false
@@ -518,14 +516,12 @@ namespace qpmodel.logic
                     fixMarkerValue(n, semi ? false : true);
                     callback(n);
                 }
-                return null;
             });
-            return null;
         }
 
         protected override double EstimateCost()
         {
-            double cost = l_().Card() * r_().Card();
+            double cost = lchild_().Card() * rchild_().Card();
             return cost;
         }
     }
@@ -535,7 +531,7 @@ namespace qpmodel.logic
         // if we can prove at most one row return, it is essentially an ordinary LOJ
         internal bool max1rowCheck_ = true;
 
-        public override string ToString() => $"{l_()} singleX {r_()}";
+        public override string ToString() => $"{lchild_()} singleX {rchild_()}";
         public LogicSingleJoin(LogicNode l, LogicNode r) : base(l, r) { type_ = JoinType.Left; }
         public LogicSingleJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { type_ = JoinType.Left; }
     }
@@ -553,10 +549,10 @@ namespace qpmodel.logic
             //            select c1 from c where c2 = a2 and c1 = (select b1 from b where b3=a3));
             //
         }
-        public override string ToString() => $"PSingleJOIN({l_()},{r_()}: {Cost()})";
+        public override string ToString() => $"PSingleJOIN({lchild_()},{rchild_()}: {Cost()})";
 
         // always the first column
-        public override string Exec(Func<Row, string> callback)
+        public override void Exec(Action<Row> callback)
         {
             ExecContext context = context_;
             var logic = logic_ as LogicSingleJoin;
@@ -567,10 +563,10 @@ namespace qpmodel.logic
             // if max1row is gauranteed, it is converted to regular LOJ
             Debug.Assert(logic.max1rowCheck_);
 
-            l_().Exec(l =>
+            lchild_().Exec(l =>
             {
                 bool foundOneMatch = false;
-                r_().Exec(r =>
+                rchild_().Exec(r =>
                 {
                     Row n = new Row(l, r);
                     if (filter is null || filter.Exec(context, n) is true)
@@ -578,32 +574,29 @@ namespace qpmodel.logic
                         bool foundDups = foundOneMatch && filter != null;
 
                         if (foundDups)
-                            throw new SemanticExecutionException("more than one row matched");
+                            throw new SemanticExecutionException("subquery must return only one row");
                         foundOneMatch = true;
 
                         // there is at least one match, mark true
                         n = ExecProject(n);
                         callback(n);
                     }
-                    return null;
                 });
 
                 // if there is no match, output it if outer join
                 if (!foundOneMatch && outerJoin)
                 {
-                    var nNulls = r_().logic_.output_.Count;
+                    var nNulls = rchild_().logic_.output_.Count;
                     Row n = new Row(l, new Row(nNulls));
                     n = ExecProject(n);
                     callback(n);
                 }
-                return null;
             });
-            return null;
         }
 
         protected override double EstimateCost()
         {
-            double cost = l_().Card() * r_().Card();
+            double cost = lchild_().Card() * rchild_().Card();
             return cost;
         }
     }
@@ -652,28 +645,24 @@ namespace qpmodel.logic
             }
         }
 
-        public override string Exec(Func<Row, string> callback)
+        public override void Exec(Action<Row> callback)
         {
             ExecContext context = context_;
             var logic = logic_ as LogicSequence;
 
             ExecNonOutputChildren();
 
-            string s = null;
-            s += OutputChild().Exec(r =>
+            OutputChild().Exec(r =>
             {
-                string code = null;
                 if (context.option_.optimize_.use_codegen_)
                 {
+                    context.code_ += $@"";
                 }
                 else
                 {
                     callback(r);
                 }
-                return code;
             });
-
-            return s;
         }
         protected override double EstimateCost()
         {
@@ -712,27 +701,23 @@ namespace qpmodel.logic
             context.RegisterCteProducer(logic.cte_.cteName_, heap_);
         }
 
-        public override string Exec(Func<Row, string> callback)
+        public override void Exec(Action<Row> callback)
         {
             ExecContext context = context_;
             var logic = logic_ as LogicCteProducer;
 
-            string s = null;
-            s += child_().Exec(r =>
+            child_().Exec(r =>
             {
-                string code = null;
                 if (context.option_.optimize_.use_codegen_)
                 {
+                    context.code_ += $@"";
                 }
                 else
                 {
                     // cache the results
                     heap_.Add(r);
                 }
-                return code;
             });
-
-            return s;
         }
 
         protected override double EstimateCost()

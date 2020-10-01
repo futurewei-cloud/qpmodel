@@ -76,7 +76,7 @@ namespace qpmodel.expr
         }
     }
 
-    public class FuncExpr : Expr
+    public partial class FuncExpr : Expr
     {
         internal string funcName_;
         internal int argcnt_;
@@ -222,8 +222,9 @@ namespace qpmodel.expr
         {
             base.Bind(context);
             type_ = args_()[0].type_;
-            Debug.Assert(type_ is CharType || type_ is VarCharType);
+            Debug.Assert(type_ is CharType || type_ is VarCharType || this.AnyArgNull());
         }
+
         public override Value Exec(ExecContext context, Row input)
         {
             string str = (string)args_()[0].Exec(context, input);
@@ -248,7 +249,7 @@ namespace qpmodel.expr
         {
             base.Bind(context);
             type_ = args_()[0].type_;
-            Debug.Assert(type_ is CharType || type_ is VarCharType);
+            Debug.Assert(type_ is CharType || type_ is VarCharType || this.AnyArgNull());
         }
         public override Value Exec(ExecContext context, Row input)
         {
@@ -268,7 +269,7 @@ namespace qpmodel.expr
         {
             base.Bind(context);
             type_ = args_()[0].type_;
-            Debug.Assert(type_ is CharType || type_ is VarCharType);
+            Debug.Assert(type_ is CharType || type_ is VarCharType || this.AnyArgNull());
         }
 
         public override Value Exec(ExecContext context, Row input)
@@ -279,6 +280,7 @@ namespace qpmodel.expr
             return string.Join("", Enumerable.Repeat(str, times));
         }
     }
+
     public class RoundFunc : FuncExpr
     {
         public RoundFunc(List<Expr> args) : base("round", args)
@@ -335,7 +337,7 @@ namespace qpmodel.expr
         }
     }
 
-    public class CoalesceFunc : FuncExpr
+    public partial class CoalesceFunc : FuncExpr
     {
         public CoalesceFunc(List<Expr> args) : base("coalesce", args)
         {
@@ -422,6 +424,16 @@ namespace qpmodel.expr
         public abstract Value Accum(ExecContext context, Value old, Row input);
         public virtual Value Finalize(ExecContext context, Value old) => old;
 
+        public virtual Expr SplitAgg()
+        {
+            // this is for sum, count, and countstar
+            var child = child_();
+            var processed = new AggSum(new List<Expr> { child.Clone() });
+            processed.children_[0] = new AggrRef(this.Clone(), -1);
+            processed.dummyBind();
+            return processed;
+        }
+
         public override object Exec(ExecContext context, Row input)
             => throw new InvalidProgramException("aggfn [some] are stateful, they use different set of APIs");
     }
@@ -489,7 +501,7 @@ namespace qpmodel.expr
     {
         // Exec info
         internal long count_;
-        public AggCountStar(List<Expr> args) : base("count(*)", new List<Expr> { new LiteralExpr("0", new IntType()) })
+        public AggCountStar(List<Expr> args) : base("count(*)", new List<Expr> { new ConstExpr("0", new IntType()) })
         {
             Debug.Assert(args is null);
             argcnt_ = 0;
@@ -499,6 +511,11 @@ namespace qpmodel.expr
         {
             base.Bind(context);
             type_ = new IntType();
+
+            // Try adding all tableRefs to fix count(*) being orphaned and
+            // getting pushed to random side when join transformations happen.
+            //
+            tableRefs_ = context.AllTableRefs();
         }
 
         public override Value Init(ExecContext context, Row input)
@@ -510,6 +527,19 @@ namespace qpmodel.expr
         {
             count_ = (long)old + 1;
             return count_;
+        }
+
+        public override int GetHashCode() => tableRefs_.ListHashCode();
+
+        // Two COUNT(*) are same/equal only if they reference same set of tables.
+        //
+        public override bool Equals(object obj)
+        {
+            if (obj is ExprRef oe)
+                return this.Equals(oe.expr_());
+            if (obj is AggCountStar ac)
+                return Utils.OrderlessEqual(tableRefs_, ac.tableRefs_);
+            return false;
         }
     }
 
@@ -542,6 +572,14 @@ namespace qpmodel.expr
 
             return min_;
         }
+        public override Expr SplitAgg()
+        {
+            var child = child_();
+            var processed = new AggMin(new List<Expr> { child.Clone() });
+            processed.children_[0] = new AggrRef(this.Clone(), -1);
+            processed.dummyBind();
+            return processed;
+        }
     }
 
     public class AggMax : AggFunc
@@ -572,6 +610,14 @@ namespace qpmodel.expr
             }
 
             return max_;
+        }
+        public override Expr SplitAgg()
+        {
+            var child = child_();
+            var processed = new AggMax(new List<Expr> { child.Clone() });
+            processed.children_[0] = new AggrRef(this.Clone(), -1);
+            processed.dummyBind();
+            return processed;
         }
     }
 
@@ -614,12 +660,15 @@ namespace qpmodel.expr
 
             Debug.Assert(old != null);
             AvgPair oldpair = old as AvgPair;
+            pair_ = oldpair;
+            Debug.Assert(oldpair.count_ >= 0);
             if (oldpair.sum_ is null)
             {
                 if (arg != null)
+                {
                     pair_.sum_ = arg;
-                else
                     pair_.count_ = 1;
+                }
             }
             else
             {
@@ -633,6 +682,25 @@ namespace qpmodel.expr
             }
 
             return pair_;
+        }
+        public override Expr SplitAgg()
+        {
+            var child = child_();
+
+            // child of tsum/tcount will be replace to bypass aggfunc child during aggfunc intialization
+            var tsum = new AggSum(new List<Expr> { child }); tsum.dummyBind();
+            var sumchild = new AggSum(new List<Expr> { child.Clone() }); sumchild.dummyBind();
+            var sumchildref = new AggrRef(sumchild, -1);
+            tsum.children_[0] = sumchildref;
+
+            var tcount = new AggSum(new List<Expr> { child }); tcount.dummyBind();
+            var countchild = new AggCount(new List<Expr> { child.Clone() }); countchild.dummyBind();
+            var countchildref = new AggrRef(countchild, -1);
+            tcount.children_[0] = countchildref;
+
+            var processed = new BinExpr(tsum, tcount, "/");
+            processed.dummyBind();
+            return processed;
         }
 
         public override Value Finalize(ExecContext context, Value old) => (old as AvgPair).Finalize();
@@ -693,6 +761,7 @@ namespace qpmodel.expr
             values_ = oldlist;
             return values_;
         }
+        public override Expr SplitAgg() => null;
         public override Value Finalize(ExecContext context, Value old) => (old as AggStddevValues).Finalize();
     }
 
@@ -707,7 +776,7 @@ namespace qpmodel.expr
         internal int nWhen_;
         internal int nElse_ = 0;
 
-        public override string ToString() => $"case with {when_().Count}";
+        public override string ToString() => $"case with {nEval_}|{when_().Count}|{nElse_}";
 
         internal Expr eval_() => nEval_ != 0 ? children_[0] : null;
         internal List<Expr> when_() => children_.GetRange(nEval_, nWhen_);
@@ -741,7 +810,7 @@ namespace qpmodel.expr
             base.Bind(context);
             type_ = then_()[0].type_;
             if (else_() != null)
-                Debug.Assert(type_.Compatible(else_().type_));
+                Debug.Assert(TypeBase.Compatible(type_, else_().type_));
         }
 
         public override int GetHashCode() => base.GetHashCode();
@@ -760,6 +829,7 @@ namespace qpmodel.expr
         {
             if (eval_() != null)
             {
+                // execute simple case
                 var eval = eval_().Exec(context, input);
                 for (int i = 0; i < when_().Count; i++)
                 {
@@ -769,6 +839,7 @@ namespace qpmodel.expr
             }
             else
             {
+                // execute searched case
                 for (int i = 0; i < when_().Count; i++)
                 {
                     if (when_()[i].Exec(context, input) is true)
@@ -781,14 +852,14 @@ namespace qpmodel.expr
         }
     }
 
-    public class UnaryExpr : Expr
+    public partial class UnaryExpr : Expr
     {
         internal string op_;
 
         internal Expr arg_() => children_[0];
         public UnaryExpr(string op, Expr expr) : base()
         {
-            string[] supportops = { "+", "-" };
+            string[] supportops = { "+", "-", "!" };
 
             op = op.ToLower();
             if (!supportops.Contains(op))
@@ -810,26 +881,28 @@ namespace qpmodel.expr
             {
                 case "-":
                     return -(dynamic)arg;
+                case "!":
+                    return !(bool)arg;
                 default:
                     return arg;
             }
         }
     }
 
-    // we can actually put all binary ops in BinExpr class but we want to keep 
+    // we can actually put all binary ops in BinExpr class but we want to keep
     // some special ones (say AND/OR) so we can coding easier
     //
-    public class BinExpr : Expr
+    public partial class BinExpr : Expr
     {
         internal string op_;
 
-        public override int GetHashCode() => l_().GetHashCode() ^ r_().GetHashCode() ^ op_.GetHashCode();
+        public override int GetHashCode() => lchild_().GetHashCode() ^ rchild_().GetHashCode() ^ op_.GetHashCode();
         public override bool Equals(object obj)
         {
             if (obj is ExprRef oe)
                 return this.Equals(oe.expr_());
             else if (obj is BinExpr bo)
-                return exprEquals(l_(), bo.l_()) && exprEquals(r_(), bo.r_()) && op_.Equals(bo.op_);
+                return exprEquals(lchild_(), bo.lchild_()) && exprEquals(rchild_(), bo.rchild_()) && op_.Equals(bo.op_);
             return false;
         }
         public BinExpr(Expr l, Expr r, string op) : base()
@@ -855,7 +928,7 @@ namespace qpmodel.expr
             base.Bind(context);
 
             // derive return type
-            Debug.Assert(l_().type_ != null && r_().type_ != null);
+            Debug.Assert(lchild_().type_ != null && rchild_().type_ != null);
             switch (op_)
             {
                 case "+":
@@ -864,21 +937,25 @@ namespace qpmodel.expr
                 case "/":
                 case "||":
                     // notice that CoerseType() may change l/r underneath
-                    type_ = ColumnType.CoerseType(op_, l_(), r_());
+                    type_ = ColumnType.CoerseType(op_, lchild_(), rchild_());
                     break;
                 case ">":
                 case ">=":
                 case "<":
                 case "<=":
-                    if (ColumnType.IsNumberType(l_().type_))
-                        ColumnType.CoerseType(op_, l_(), r_());
+                    if (TypeBase.IsNumberType(lchild_().type_))
+                        ColumnType.CoerseType(op_, lchild_(), rchild_());
+                    else if (TypeBase.OnlyOneIsStringType(lchild_().type_, rchild_().type_))
+                        throw new SemanticAnalyzeException("no implicit conversion of character type values");
                     type_ = new BoolType();
                     break;
                 case "=":
                 case "<>":
                 case "!=":
-                    if (ColumnType.IsNumberType(l_().type_))
-                        ColumnType.CoerseType(op_, l_(), r_());
+                    if (TypeBase.IsNumberType(lchild_().type_))
+                        ColumnType.CoerseType(op_, lchild_(), rchild_());
+                    else if (TypeBase.OnlyOneIsStringType(lchild_().type_, rchild_().type_))
+                        throw new SemanticAnalyzeException("no implicit conversion of character type values");
                     type_ = new BoolType();
                     break;
                 case " and ":
@@ -912,34 +989,66 @@ namespace qpmodel.expr
 
         public void SwapSide()
         {
-            var oldl = l_();
-            children_[0] = r_();
+            var oldl = lchild_();
+            children_[0] = rchild_();
             children_[1] = oldl;
             op_ = SwapSideOp(op_);
         }
 
-        public override string ToString() => $"{l_()}{op_}{r_()}{outputName()}";
+        public override string ToString()
+        {
+            bool addParen = false;
+            string space = null;
+            switch (op_)
+            {
+                case "like":
+                case "not like":
+                case "in":
+                case "is":
+                case "is not":
+                    space = " ";
+                    break;
+
+                case "+":
+                case "-":
+                case " or ":
+                case " and ":
+                    addParen = true;
+                    break;
+            }
+
+            string str = "";
+            if (addParen)
+                str += "(";
+
+            str += $"{lchild_()}{space}{op_}{space}{rchild_()}{outputName()}";
+
+            if (addParen)
+                str += ")";
+
+            return str;
+        }
 
         public override Value Exec(ExecContext context, Row input)
         {
-            string[] nullops = { "is", "||" };
-            dynamic lv = l_().Exec(context, input);
-            dynamic rv = r_().Exec(context, input);
+            string[] nullops = { "is", "||", "is not" };
+            dynamic lv = lchild_().Exec(context, input);
+            dynamic rv = rchild_().Exec(context, input);
 
             if (!nullops.Contains(op_) && (lv is null || rv is null))
                 return null;
 
             switch (op_)
             {
-                // we can do a compile type type coerse for addition/multiply etc to align 
-                // data types, say double+decimal will require both side become decimal. 
+                // we can do a compile type type coerse for addition/multiply etc to align
+                // data types, say double+decimal will require both side become decimal.
                 // However, for comparison, we cam't do that, because that depends the actual
                 // value: decimal has better precision and double has better range, if double
                 // if out of decimal's range, we shall convert both to double; otherwise they
                 // shall be converted to decimals.
                 //
                 // We do a simplification here by forcing type coerse for any op at Bind().
-                // 
+                //
                 case "+": return lv + rv;
                 case "-": return lv - rv;
                 case "*": return lv * rv;
@@ -973,8 +1082,8 @@ namespace qpmodel.expr
 
         public override string ExecCode(ExecContext context, string input)
         {
-            string lv = "(dynamic)" + l_().ExecCode(context, input);
-            string rv = "(dynamic)" + r_().ExecCode(context, input);
+            string lv = "(dynamic)" + lchild_().ExecCode(context, input);
+            string rv = "(dynamic)" + rchild_().ExecCode(context, input);
 
             string code = null;
             switch (op_)
@@ -1009,7 +1118,7 @@ namespace qpmodel.expr
             var andorlist = new List<Expr>();
             for (int i = 0; i < 2; i++)
             {
-                Expr e = i == 0 ? l_() : r_();
+                Expr e = i == 0 ? lchild_() : rchild_();
                 if (isAnd && e is LogicAndExpr ea)
                     andorlist.AddRange(ea.BreakToList(isAnd));
                 else if (!isAnd && e is LogicOrExpr eo)
@@ -1044,8 +1153,8 @@ namespace qpmodel.expr
 
         public override Value Exec(ExecContext context, Row input)
         {
-            dynamic lv = l_().Exec(context, input);
-            dynamic rv = r_().Exec(context, input);
+            dynamic lv = lchild_().Exec(context, input);
+            dynamic rv = rchild_().Exec(context, input);
 
             if (lv is null) lv = false;
             if (rv is null) rv = false;
@@ -1053,7 +1162,7 @@ namespace qpmodel.expr
         }
     }
 
-    public class CastExpr : Expr
+    public partial class CastExpr : Expr
     {
         public override string ToString() => $"cast({child_()} to {type_})";
         public CastExpr(Expr child, ColumnType coltype) : base() { children_.Add(child); type_ = coltype; }

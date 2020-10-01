@@ -35,6 +35,7 @@ using System.Threading;
 
 using qpmodel.stat;
 using qpmodel.sqlparser;
+using qpmodel.utils;
 using qpmodel.expr;
 using qpmodel.logic;
 using qpmodel.physic;
@@ -42,6 +43,7 @@ using qpmodel.index;
 using qpmodel.test;
 
 using TableColumn = System.Tuple<string, string>;
+using qpmodel.optimizer;
 
 namespace qpmodel
 {
@@ -51,8 +53,11 @@ namespace qpmodel
         readonly public ColumnType type_;
         public int ordinal_;
 
-        public ColumnDef(string name, ColumnType type, int ord) { name_ = name; type_ = type; ordinal_ = ord; }
-        public ColumnDef(string name, int ord) : this(name, new IntType(), ord) { }
+        public ColumnDef(string name, ColumnType type, int ord)
+        {
+            name_ = Utils.normalizeName(name);
+            type_ = type; ordinal_ = ord;
+        }
 
         public override string ToString() => $"{name_} {type_} [{ordinal_}]";
     }
@@ -67,12 +72,20 @@ namespace qpmodel
 
     public class TableDef
     {
+        public enum DistributionMethod
+        {
+            NonDistributed,
+            Distributed,
+            Replicated,
+            Roundrobin
+        }
         public string name_;
         public Dictionary<string, ColumnDef> columns_;
+        public DistributionMethod distMethod_ = DistributionMethod.NonDistributed;
         public ColumnDef distributedBy_;
         public List<IndexDef> indexes_ = new List<IndexDef>();
 
-        // emulated storage across multiple machines
+        // emulated storage across multiple machines: replicated or distributed
         public List<Distribution> distributions_ = new List<Distribution>();
 
         public TableDef(string tabName, List<ColumnDef> columns, string distributedBy)
@@ -81,18 +94,31 @@ namespace qpmodel
             Dictionary<string, ColumnDef> cols = new Dictionary<string, ColumnDef>();
             foreach (var c in columns)
                 cols.Add(c.name_, c);
-            name_ = tabName; columns_ = cols;
+            name_ = Utils.normalizeName(tabName);
+            columns_ = cols;
+            Debug.Assert(distMethod_ == DistributionMethod.NonDistributed);
 
             if (distributedBy != null)
             {
-                cols.TryGetValue(distributedBy, out var partcol);
-                if (partcol is null)
-                    throw new SemanticAnalyzeException($"can't find distribution column '{distributedBy}'");
-                distributedBy_ = partcol;
+                ColumnDef partcol;
+                if (distributedBy == "REPLICATED")
+                    distMethod_ = DistributionMethod.Replicated;
+                else if (distributedBy == "ROUNDROBIN")
+                    distMethod_ = DistributionMethod.Roundrobin;
+                else
+                {
+                    cols.TryGetValue(distributedBy, out partcol);
+                    if (partcol is null)
+                        throw new SemanticAnalyzeException($"can't find distribution column '{distributedBy}'");
+
+                    distMethod_ = DistributionMethod.Distributed;
+                    distributedBy_ = partcol;
+                }
                 npart = QueryOption.num_machines_;
             }
             for (int i = 0; i < npart; i++)
                 distributions_.Add(new Distribution());
+            Debug.Assert(distributedBy_ is null || distMethod_ == DistributionMethod.Distributed);
         }
 
         public List<ColumnDef> ColumnsInOrder()
@@ -140,8 +166,9 @@ namespace qpmodel
     {
         readonly Dictionary<string, TableDef> records_ = new Dictionary<string, TableDef>();
 
-        public void CreateTable(string tabName, List<ColumnDef> columns, string distributedBy)
+        public void CreateTable(string tabName, List<ColumnDef> columns, string distributedBy = null)
         {
+            tabName = Utils.normalizeName(tabName);
             records_.Add(tabName,
                 new TableDef(tabName, columns, distributedBy));
         }
@@ -198,13 +225,16 @@ namespace qpmodel
 
     public static class Catalog
     {
+        // global random generator
+        public static Random rand_ = new Random();
+
         // list of system tables
         public static SysTable systable_ = new SysTable();
         public static SysStats sysstat_ = new SysStats();
 
-        static void createOptimizerTables()
+        static void createOptimizerTestTables()
         {
-            List<ColumnDef> cols = new List<ColumnDef> { new ColumnDef("i", 0) };
+            List<ColumnDef> cols = new List<ColumnDef> { new ColumnDef("i", new IntType(), 0) };
             for (int i = 0; i < 30; i++)
             {
                 Catalog.systable_.CreateTable($"T{i}", cols, null);
@@ -231,15 +261,19 @@ namespace qpmodel
                 @"create table bd (b1 int, b2 int, b3 int, b4 int) distributed by b1;",
                 @"create table cd (c1 int, c2 int, c3 int, c4 int) distributed by c1;",
                 @"create table dd (d1 int, d2 int, d3 int, d4 int) distributed by d1;",
+                @"create table ar (a1 int, a2 int, a3 int, a4 int) replicated;",
+                @"create table br (b1 int, b2 int, b3 int, b4 int) replicated;",
+                @"create table arb (a1 int, a2 int, a3 int, a4 int) roundrobin;",
+                @"create table brb (b1 int, b2 int, b3 int, b4 int) roundrobin;",
                 // steaming tables
                 @"create table ast (a0 datetime, a1 int, a2 int, a3 int, a4 int);",
             };
             SQLStatement.ExecSQLList(string.Join("", createtables));
 
             // load tables
-            var curdir = Directory.GetCurrentDirectory();
-            var folder = $@"{curdir}/../../../../data";
-            var tables = new List<string>() {"test", "a", "b", "c", "d", "r", "ad", "bd", "cd", "dd", "ast" };
+            var appbin_dir = AppContext.BaseDirectory.Substring(0, AppContext.BaseDirectory.LastIndexOf("bin"));
+            var folder = $@"{appbin_dir}/../data";
+            var tables = new List<string>() { "test", "a", "b", "c", "d", "r", "ad", "bd", "cd", "dd", "ar", "br", "arb", "brb", "ast" };
             foreach (var v in tables)
             {
                 string filename = $@"'{folder}/{v}.tbl'";
@@ -262,15 +296,19 @@ namespace qpmodel
             }
         }
 
-        static Catalog()
+        static void createSystemTables()
         {
+            // memo table
+            Catalog.systable_.CreateTable(SysMemoExpr.name_, SysMemoExpr.GetSchema());
+            Catalog.systable_.CreateTable(SysMemoProperty.name_, SysMemoProperty.GetSchema());
         }
 
         static public void Init()
         {
             // Create some internal tables for easier testing
+            createSystemTables();
             createBuildInTestTables();
-            createOptimizerTables();
+            createOptimizerTestTables();
 
             // Change current culture: different locales have different ways to format the time. 
             // We are using text comparison in the tests so formatting can cause trouble.

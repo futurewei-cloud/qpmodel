@@ -59,3 +59,15 @@ Unittest comes up with multiple tests covering major functionalities:
 - TPCH end to end power run with small data set
 - TPCDS, JoBench only exercise the optimizer
 - Other grouped unittest stressing different aspects
+
+### Meeting 
+
+Regular Community Meeting:
+1) Tuesday, July 14, 2020 8:00 PM-9:30 PM (UTC-08:00) Pacific Time (US & Canada).
+Zoom: https://futurewei.zoom.us/j/97155138938
+2) Tuesday, Sept 29, 2020 7:00 PM-8:30 PM (UTC-08:00) Pacific Time (US & Canada).
+Zoom: https://futurewei.zoom.us/j/8320379082
+
+Link for Videos:
+https://www.youtube.com/playlist?list=PL_7gYB_Le9d2OFbt67OgQPSynRIWvTtU6
+

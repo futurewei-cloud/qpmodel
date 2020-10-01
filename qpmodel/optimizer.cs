@@ -29,41 +29,262 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.expr;
+using qpmodel.utils;
 
 using LogicSignature = System.Int64;
+using Microsoft.VisualBasic.CompilerServices;
 
 // TODO:
 //  - branch and bound prouning
-//  - enforcer: by test Join2MJ and indexing
 //  - aggregation/ctes: by generate multiple memo
 //
 
 namespace qpmodel.optimizer
 {
+    using ChildrenRequirement = System.Collections.Generic.List<PhysicProperty>;
+
     public class Property { }
 
-    // ordering, distribution
+    // A physic property is a combination of <ordering, distribution>
+    //
     public class PhysicProperty : Property
     {
+        public static PhysicProperty NullProperty_ = new PhysicProperty();
+
         // ordering: the ordered expression and whether is descending
-        KeyValuePair<Expr, bool> ordering_;
-        KeyValuePair<Expr, DistributionType> distribution_;
+        public List<(Expr expr, bool desc)> ordering_ = new List<(Expr expr, bool desc)>();
+
+        // distribution: what distribution type and expressions (for some of types)
+        public (DistrType disttype, List<Expr> exprs) distribution_ = (DistrType.AnyDistributed, null);
+
+        // Does testee satisfy my property requirements?
+        public bool IsSuppliedBy(PhysicProperty testee) => OrderIsSuppliedBy(testee) && DistributionIsSuppliedBy(testee);
+
+        public bool OrderIsSuppliedBy(PhysicProperty testee)
+        {
+            // testee may provide more ordering than I needed
+            if (ordering_.Count <= testee.ordering_.Count)
+            {
+                for (int i = 0; i < ordering_.Count; i++)
+                    if (!ordering_[i].expr.Equals(testee.ordering_[i].expr) ||
+                        ordering_[i].desc != testee.ordering_[i].desc)
+                        return false;
+                return true;
+            }
+            return false;
+        }
+
+        public bool DistributionIsSuppliedBy(PhysicProperty testee)
+        {
+            var testeeType = testee.distribution_.disttype;
+            switch (distribution_.disttype)
+            {
+                case DistrType.AnyDistributed:
+                    return testeeType == DistrType.Distributed
+                        || testeeType == DistrType.AnyDistributed;
+                case DistrType.Singleton:
+                    return testeeType == DistrType.Singleton;
+                // distribution expr list must match to be considered supplied
+                case DistrType.Distributed:
+                    if (testeeType == DistrType.Singleton)
+                        return true;
+                    if (testeeType == DistrType.Distributed)
+                    {
+                        if (distribution_.exprs.Count <= testee.distribution_.exprs.Count)
+                        {
+                            foreach (var expr in distribution_.exprs)
+                                if (!testee.distribution_.exprs.Contains(expr))
+                                    return false;
+                        }
+                        return true;
+                    }
+                    return false;
+                // replicated can only be satisfied by replicated
+                // since the gather node for that is different
+                case DistrType.Replicated:
+                    return testeeType == DistrType.Replicated;
+                default:
+                    Debug.Assert(false);
+                    return false;
+            }
+        }
+
+        // enforce my property to the @node where @node already have property @nodehave
+        internal PhysicNode EnforceProperty(PhysicNode node, PhysicProperty nodehave)
+        {
+            // since the property tranformation process is
+            // one enforcement node, either the order is supplied
+            // or the distribution is supplied
+            if (OrderIsSuppliedBy(nodehave))
+                return EnforceDistribution(node, nodehave);
+            if (DistributionIsSuppliedBy(nodehave))
+                return EnforceOrder(node, nodehave);
+            Debug.Assert(false);
+            return null;
+        }
+
+        // Not need to process @nodehave because say @nodehave = 'order by a' and my property is
+        // is 'order by a, b', I still have to do add both 'a' and 'b' to the PhysicOrder unless
+        // we support partial sort functionality (caching 'a''s nth value each time, sorting 'b').
+        //
+        internal PhysicNode EnforceOrder(PhysicNode node, PhysicProperty nodehave)
+        {
+            List<Expr> order = new List<Expr>();
+            List<bool> desc = new List<bool>();
+            foreach (var pair in ordering_)
+            {
+                order.Add(pair.expr);
+                desc.Add(pair.desc);
+            }
+            var logicnode = new LogicOrder(node.logic_, order, desc);
+            return new PhysicOrder(logicnode, node);
+        }
+
+        internal PhysicNode EnforceDistribution(PhysicNode node, PhysicProperty nodehave)
+        {
+            // if distribution need to be enforced, there are these different scenarios
+            // 1.1 required is singleton, node is for any
+            // 1.2 required is singleton, node is for replicated
+            // 2 required is distributed, node is different distribution
+            //
+            var mytype = distribution_.disttype;
+            var havedist = nodehave.distribution_.disttype;
+            if (mytype == DistrType.Singleton)
+            {
+                LogicGather logicnode = null;
+                Debug.Assert(havedist == DistrType.AnyDistributed || havedist == DistrType.Replicated);
+                if (nodehave.distribution_.disttype == DistrType.AnyDistributed)
+                    logicnode = new LogicGather(node.logic_);
+                else
+                    logicnode = new LogicGather(node.logic_, new List<int> { 0 });
+                return new PhysicGather(logicnode, node);
+            }
+            else if (mytype == DistrType.Replicated)
+            {
+                Debug.Assert(havedist == DistrType.AnyDistributed);
+                var logicnode = new LogicBroadcast(node.logic_);
+                return new PhysicBroadcast(logicnode, node);
+            }
+            else
+            {
+                Debug.Assert(havedist == DistrType.AnyDistributed);
+                Debug.Assert(mytype == DistrType.Distributed);
+                var logicnode = new LogicRedistribute(node.logic_, distribution_.exprs);
+                return new PhysicRedistribute(logicnode, node);
+            }
+        }
+
+        public bool Equals(PhysicProperty other)
+        {
+            if (other is null || ordering_.Count != other.ordering_.Count)
+                return false;
+            for (int i = 0; i < ordering_.Count; i++)
+            {
+                if (!ordering_[i].expr.Equals(other.ordering_[i].expr))
+                    return false;
+                if (ordering_[i].desc != other.ordering_[i].desc)
+                    return false;
+            }
+            if (other.distribution_.disttype != distribution_.disttype)
+                return false;
+            if (distribution_.disttype == DistrType.Distributed)
+            {
+                if (distribution_.exprs.Count != other.distribution_.exprs.Count)
+                    return false;
+                for (int i = 0; i < distribution_.exprs.Count; i++)
+                {
+                    if (!distribution_.exprs[i].Equals(other.distribution_.exprs[i]))
+                        return false;
+                }
+            }
+            return true;
+        }
+        public override bool Equals(object obj)
+        {
+            if ((obj as PhysicProperty) is null) return false;
+            return this.Equals(obj as PhysicProperty);
+        }
+        public override int GetHashCode() => ordering_.ListHashCode();
+        public override string ToString()
+        {
+            var s = $"{{{string.Join(",", ordering_)}|{distribution_.disttype}";
+            if (distribution_.disttype == DistrType.Distributed)
+                s += $":{string.Join(",", distribution_.exprs)}}}";
+            else
+                s += "}";
+            return s;
+        }
     }
-    public enum DistributionType { }
+
+    public class SortOrderProperty : PhysicProperty
+    {
+        // default order property is only for singleton
+        public SortOrderProperty(List<Expr> order, List<bool> desc = null)
+        {
+            if (desc is null)
+                desc = new List<bool>(Enumerable.Repeat(false, order.Count).ToArray());
+            Debug.Assert(order.Count == desc.Count);
+            ordering_ = new List<(Expr, bool)>();
+            for (int i = 0; i < order.Count; i++)
+                ordering_.Add((order[i], desc[i]));
+            distribution_ = (DistrType.Singleton, null);
+        }
+    }
+
+    public enum DistrType
+    {
+        Singleton,       // N->1, all data
+        Distributed,     // N->N, part data
+        Replicated,      // N->N, all data
+
+        AnyDistributed, // not a actualy distribution type, refer to Distributed 
+                        // but does not have to provide distribution column etc
+    }
+
+    public class DistrProperty : PhysicProperty
+    {
+        public static PhysicProperty Singleton_ = newProperty(DistrType.Singleton);
+        public static PhysicProperty Replicated_ = newProperty(DistrType.Replicated);
+        public static PhysicProperty AnyDistributed_ = newProperty(DistrType.AnyDistributed);
+
+        static DistrProperty newProperty(DistrType type)
+        {
+            var rep = new DistrProperty();
+            rep.distribution_.disttype = type;
+            return rep;
+        }
+
+        public DistrProperty(List<Expr> dist)
+        {
+            if (dist.Count > 0)
+                distribution_ = (DistrType.Distributed, dist);
+        }
+
+        // constructor for base property
+        public DistrProperty()
+        {
+            distribution_ = (DistrType.Singleton, null);
+        }
+    }
 
     // CGroupMember is a member of CMemoGroup, all these memebers are logically
     // equvalent but different logical/physical implementations
     //
     public class CGroupMember
     {
-        public LogicNode logic_;
-        public PhysicNode physic_;
-
         internal CMemoGroup group_;
+        internal LogicNode logic_;
+        internal PhysicNode physic_;
+
+        // record the property that is provided and property that is required to children
+        public Dictionary<PhysicProperty, ChildrenRequirement> propertyPairs_
+            = new Dictionary<PhysicProperty, ChildrenRequirement>();
+        public bool isEnforcer_ = false;
 
         internal QueryOption QueryOption() => group_.memo_.stmt_.queryOpt_;
         internal SQLStatement Stmt() => group_.memo_.stmt_;
@@ -102,6 +323,9 @@ namespace qpmodel.optimizer
             if (group_.IsSolverOptimizedGroup())
                 return;
 
+            // enforcement member must have physic_
+            if (isEnforcer_) Debug.Assert(physic_ != null);
+
             // all its children shall be memo nodes and can be deref'ed to non-memo node
             Logic().children_.ForEach(x => Debug.Assert(
                     x is LogicMemoRef xl && !(xl.Deref() is LogicMemoRef)));
@@ -114,6 +338,11 @@ namespace qpmodel.optimizer
                 // all its children shall be memo nodes and can be deref'ed to non-memo node
                 physic_.children_.ForEach(x => Debug.Assert(
                     x is PhysicMemoRef xp && !(xp.Logic().Deref() is LogicMemoRef)));
+
+                // enforcement node must reference back to the same group
+                if (isEnforcer_)
+                    physic_.children_.ForEach(x => Debug.Assert(
+                        (x as PhysicMemoRef).Group().logicSign_ == group_.logicSign_));
             }
         }
 
@@ -154,10 +383,11 @@ namespace qpmodel.optimizer
 
         // Apply rule to current members and generate a set of new members for each
         // of the new memberes, find/add itself or its children in the group
+        //
         internal List<CGroupMember> ExploreMember(Memo memo)
         {
             var list = group_.exprList_;
-            foreach (var rule in Rule.ruleset_)
+            foreach (var rule in group_.memo_.optimizer_.ruleset_)
             {
                 if (rule.Appliable(this))
                 {
@@ -179,9 +409,9 @@ namespace qpmodel.optimizer
                     // do some verification: newmember shall have the same signature as old ones
                     if (newlogic.MemoLogicSign() != list[0].MemoSignature())
                     {
-                        Console.WriteLine("********* list[0]");
+                        Console.WriteLine("ERROR: ********* list[0]");
                         Console.WriteLine(list[0].Logic().Explain());
-                        Console.WriteLine("********* newlogic");
+                        Console.WriteLine("ERROR: ********* newlogic");
                         Console.WriteLine(newlogic.Explain());
                     }
                     Debug.Assert(newlogic.MemoLogicSign() == list[0].MemoSignature());
@@ -193,10 +423,11 @@ namespace qpmodel.optimizer
     }
 
     // A CMemoGroup represents equvalent logical and physical transformations of the same expr.
-    // To identify a group, we use a LogicSignature and equalvalent plans shall have the same
-    // signature. How to generate it? Though there are physical/logical plans, finally the 
-    // problem boiled down to logic plan signature generation since physical can always use 
-    // its logic to compute signature.
+    // It shall also include members generated by property enforcement. To identify a group, we
+    // use a LogicSignature and equalvalent plans shall have the same signature. 
+    // How to generate it? Though there are physical/logical plans, finally the problem boiled
+    // down to logic plan signature generation since physical can always use its logic to compute
+    // the signature.
     // 
     // 1. Signature must consider attributes.
     // Consider the following query:
@@ -227,8 +458,30 @@ namespace qpmodel.optimizer
         public List<CGroupMember> exprList_ = new List<CGroupMember>();
 
         public bool explored_ = false;
-        public CGroupMember minMember_ { get; set; }
-        public double minIncCost_ = double.NaN;
+
+        // expression in the same group shall have the same cardinality
+        public ulong groupcard_ = LogicNode.CARD_INVALID;
+
+        // minMember_ depends on the property: each property has a different inclusive cost min member
+        //    0: <no property required>, hash join
+        //    1: <order on column a>, NLJ with outer table sorted on a (better than sort on HJ since
+        //      the join generate many rows).
+        //
+        public Dictionary<PhysicProperty, (CGroupMember member, double cost)> minMember_ { get; set; }
+            = new Dictionary<PhysicProperty, (CGroupMember, double)>();
+
+        public double nullPropertyMinIncCost
+        {
+            get
+            {
+                if (minMember_.ContainsKey(PhysicProperty.NullProperty_))
+                    return minMember_[PhysicProperty.NullProperty_].cost;
+                else if (minMember_.ContainsKey(PhysicProperty.NullProperty_))
+                    return minMember_[DistrProperty.Singleton_].cost;
+                else
+                    return minMember_[minMember_.Keys.ToList()[0]].cost;
+            }
+        }
 
         // debug info
         internal Memo memo_;
@@ -254,6 +507,8 @@ namespace qpmodel.optimizer
                 // all members within a group are logically equavalent
                 var member = exprList_[i];
                 member.ValidateMember(optimizationDone);
+
+                Debug.Assert(groupcard_ == member.Logic().Card());
                 Debug.Assert(exprList_[0].MemoSignature() == member.MemoSignature());
             }
         }
@@ -294,8 +549,24 @@ namespace qpmodel.optimizer
         public string Print()
         {
             CountMembers(out int clogics, out int cphysics);
-            var str = $"{clogics}, {cphysics}, [{logicSign_}][{minIncCost_}]: ";
+            var str = $"{clogics}, {cphysics}, [{logicSign_}][{nullPropertyMinIncCost}]: ";
             str += string.Join(",", exprList_);
+
+            // add property optimal member
+            if (minMember_.Count > 0)
+            {
+                List<string> l = new List<string>();
+                foreach (var pair in minMember_)
+                {
+                    var s = $"property:{pair.Key}, member:{pair.Value.member}, cost:{pair.Value.cost.ToString("0.##")}";
+                    foreach (var childpair in pair.Value.member.propertyPairs_)
+                        s += $"\n\t\treq:{childpair.Key}, child:({string.Join(",", childpair.Value ?? new ChildrenRequirement())})";
+                    l.Add(s);
+                }
+                str += "\n\t";
+                str += string.Join("\n\t", l);
+            }
+
             return str;
         }
 
@@ -305,27 +576,27 @@ namespace qpmodel.optimizer
             return exprList_[0].Logic() is LogicJoinBlock;
         }
 
-        internal void OptimizeSolverOptimizedGroupChildren(Memo memo)
-        {
-            Debug.Assert(IsSolverOptimizedGroup());
-            CGroupMember member = exprList_[0];
-            var joinblock = member.Logic() as LogicJoinBlock;
-
-            // optimize all children group and newly generated groups
-            var prevGroupCount = memo.cgroups_.Count;
-            joinblock.children_.ForEach(x =>
-                    (x as LogicMemoRef).group_.ExploreGroup(memo));
-            while (memo.stack_.Count > prevGroupCount)
-                memo.stack_.Pop().ExploreGroup(memo);
-
-            // calculate the lowest inclusive members
-            foreach (var c in joinblock.children_)
-                (c as LogicMemoRef).group_.CalculateMinInclusiveCostMember();
-        }
-
         // loop through and explore members of the group
         public void ExploreGroup(Memo memo)
         {
+            void OptimizeSolverOptimizedGroupChildren(Memo memo)
+            {
+                Debug.Assert(IsSolverOptimizedGroup());
+                CGroupMember member = exprList_[0];
+                var joinblock = member.Logic() as LogicJoinBlock;
+
+                // optimize all children group and newly generated groups
+                var prevGroupCount = memo.cgroups_.Count;
+                joinblock.children_.ForEach(x =>
+                        (x as LogicMemoRef).group_.ExploreGroup(memo));
+                while (memo.stack_.Count > prevGroupCount)
+                    memo.stack_.Pop().ExploreGroup(memo);
+
+                // calculate the lowest inclusive members
+                foreach (var c in joinblock.children_)
+                    (c as LogicMemoRef).group_.CalculateMinInclusiveCostMember();
+            }
+
             // solver group shall optimize all its children before it can start
             if (IsSolverOptimizedGroup())
                 OptimizeSolverOptimizedGroupChildren(memo);
@@ -342,102 +613,158 @@ namespace qpmodel.optimizer
             explored_ = true;
         }
 
-        // propagate the property requirement from the top
-        public void PropagateProperty(PhysicProperty property)
+        // generate a list of properties that can be relaxed from the required property
+        // using only on enforcement node
+        // TODO: merge this logic with IsDistributionSupplied()
+        //
+        internal List<PhysicProperty> GenerateRelaxedProperties(PhysicProperty required)
         {
-            return;
+            var queryOpt = memo_.stmt_.queryOpt_;
+            var output = new List<PhysicProperty>();
+            var reqdistr = required.distribution_.disttype;
+            // if there is order and the distribution requirement is singleton, 
+            // remove order and add to list
+            if (required.ordering_.Count > 0)
+            {
+                if (reqdistr == DistrType.Singleton)
+                {
+                    var nonorder = new PhysicProperty();
+                    nonorder.distribution_ = required.distribution_;
+                    output.Add(nonorder);
+                }
+            }
+            // distribution requirement tranformation is only enabled
+            // if table is replicated or distributed
+            else if (queryOpt.optimize_.memo_use_remoteexchange_)
+            {
+                if (reqdistr == DistrType.Distributed ||
+                    reqdistr == DistrType.Singleton ||
+                    (queryOpt.optimize_.enable_broadcast_ && reqdistr == DistrType.Replicated))
+                    output.Add(DistrProperty.AnyDistributed_);
+                if (reqdistr == DistrType.Singleton)
+                    output.Add(DistrProperty.Replicated_);
+            }
+            return output;
         }
 
-        // scan through the member list and return the least cost member
-        public CGroupMember locateMinCostMember()
+        // For the required property, find out the cheapest group member
+        public CGroupMember CalculateMinInclusiveCostMember(PhysicProperty required)
         {
-            double mincost = double.MaxValue;
-            foreach (var v in exprList_)
+            // directly return min cost member if already calculated
+            if (minMember_.ContainsKey(required))
+                return minMember_[required].member;
+
+            // computation must be after exploration
+            Debug.Assert(explored_ && exprList_.Count >= 2);
+            CGroupMember optmember = null;
+            double cheapestIncCost = Double.MaxValue;
+            bool isleaf = exprList_[0].Logic().children_.Count == 0 || IsSolverOptimizedGroup();
+
+            // add less strict property into the dictionary by enforcing to required proerty, expand
+            // the exprList_ and locate the optmember for the required property.
+            //
+            var childproperties = GenerateRelaxedProperties(required);
+            foreach (var prop in childproperties)
             {
-                var physic = v.physic_;
-                if (physic != null && physic.Cost() < mincost)
+                // assuming we disabled broadcast and prop is replicated, then we can't find the member
+                //
+                var member = CalculateMinInclusiveCostMember(prop);
+                if (member is null) continue;
+
+                // add enforcerNode (say PhysicOrder or distribution) and fit into exprList_
+                //
+                var enforcerNode = required.EnforceProperty(member.physic_, prop);
+                Debug.Assert(enforcerNode.children_.Count == 1);
+                enforcerNode.children_ = new List<PhysicNode> { new PhysicMemoRef(new LogicMemoRef(this)) };
+                var newmember = new CGroupMember(enforcerNode, this);
+                newmember.isEnforcer_ = true;
+                newmember.propertyPairs_.Add(required, new ChildrenRequirement { prop });
+                exprList_.Add(newmember);
+
+                // calculate the derived members from less strict property
+                // an important assumption here is that enforcement member does not change cardinality
+                (var _, var cost) = minMember_[prop];
+                cost += newmember.physic_.Cost();
+                if (cost < cheapestIncCost)
                 {
-                    mincost = physic.Cost();
-                    minMember_ = v;
+                    cheapestIncCost = cost;
+                    optmember = newmember;
                 }
             }
 
-            minIncCost_ = mincost;
-            Debug.Assert(IsSolverOptimizedGroup() ||
-                minMember_.physic_.InclusiveCost() == minIncCost_);
-            return minMember_;
-        }
-
-        public CGroupMember CalculateMinInclusiveCostMember()
-        {
-            // inclusive cost is only possible after exploration done
-            Debug.Assert(explored_);
-            Debug.Assert(exprList_.Count >= 2);
-
-            if (minMember_ != null)
-                return minMember_;
-
-            if (exprList_[0].Logic().children_.Count == 0 || IsSolverOptimizedGroup())
+            // go through every existing physic member
+            // if required property can be provided, update the best member
+            foreach (var member in exprList_)
             {
-                // if this group has no children node or a block optimization, simply locate the lowest one
-                locateMinCostMember();
-            }
-            else
-            {
-                // there are children. So for each member in the list, we calculate the inclusive
-                // cost and return the lowest one
-                var incCost = new List<double>();
-                for (int i = 0; i < exprList_.Count; i++)
+                var curphysic = member.physic_;
+                if (curphysic is null || member.isEnforcer_)
+                    continue;
+
+                if (curphysic.CanProvide(required, out var listChildReqs))
                 {
-                    var physic = exprList_[i].physic_;
-                    var cost = double.MaxValue;
-                    if (physic != null)
+                    double cost = curphysic.Cost();
+                    if (!isleaf)
                     {
-                        cost = physic.Cost();
-                        foreach (var child in physic.children_)
+                        // when the group is not leaf, it is possible that there are more than
+                        // one set of viable child properties, need to find the best set
+                        //
+                        ChildrenRequirement minchildprops = null;
+                        var minchildcost = Double.MaxValue;
+                        foreach (var childprops in listChildReqs)
                         {
-                            var childgroup = (child as PhysicMemoRef).Group();
-                            childgroup.CalculateMinInclusiveCostMember();
-                            cost += childgroup.minIncCost_;
-                        }
-                    }
-                    incCost.Add(cost);
-                }
+                            var childcost = curphysic.Cost();
+                            for (int i = 0; i < curphysic.children_.Count; i++)
+                            {
+                                var child = curphysic.children_[i];
+                                var childgroup = (child as PhysicMemoRef).Group();
+                                childgroup.CalculateMinInclusiveCostMember(childprops[i]);
 
-                // now find the lowest
-                Debug.Assert(incCost.Count == exprList_.Count);
-                double mincost = double.MaxValue;
-                int minindex = -1;
-                for (int i = 0; i < incCost.Count; i++)
-                {
-                    if (incCost[i] < mincost)
+                                // it is possible that the child group cannot satisfy the property
+                                if (childgroup.minMember_.ContainsKey(childprops[i]))
+                                    childcost += childgroup.minMember_[childprops[i]].cost;
+                                else
+                                    childcost = Double.MaxValue;
+                            }
+                            if (childcost < minchildcost)
+                            {
+                                minchildcost = childcost;
+                                minchildprops = childprops;
+                            }
+                        }
+                        cost += minchildcost;
+                        if (minchildprops != null)
+                            member.propertyPairs_.Add(required, minchildprops);
+                    }
+                    if (cost < cheapestIncCost)
                     {
-                        mincost = incCost[i];
-                        minindex = i;
+                        optmember = member;
+                        cheapestIncCost = cost;
                     }
                 }
-                Debug.Assert(minindex != -1);
-                minMember_ = exprList_[minindex];
-                minIncCost_ = mincost;
-                Debug.Assert(minMember_.physic_.InclusiveCost() == minIncCost_);
             }
 
-            Debug.Assert(minMember_.physic_ != null);
-            Debug.Assert(!double.IsNaN(minIncCost_));
-            return minMember_;
-        }
+            // when there exist at least one feasible member
+            // add the optimal member and inclusive cost into the dictionary
+            if (optmember != null)
+                minMember_.Add(required, (optmember, cheapestIncCost));
 
-        public PhysicNode CopyOutMinLogicPhysicPlan(PhysicNode knownMinPhysic = null)
+            return optmember;
+        }
+        public CGroupMember CalculateMinInclusiveCostMember()
+            => CalculateMinInclusiveCostMember(PhysicProperty.NullProperty_);
+
+        public PhysicNode CopyOutMinLogicPhysicPlan(PhysicProperty property, PhysicNode knownMinPhysic = null)
         {
             var queryOpt = memo_.stmt_.queryOpt_;
 
             // if user does not provides a physic node, get the lowest inclusive
-            // cost one from the member list. Either wya, always use a clone to
+            // cost one from the member list. Either way, always use a clone to
             // not change memo itself.
             //
+            CGroupMember minmember = null;
             if (knownMinPhysic is null)
             {
-                var minmember = CalculateMinInclusiveCostMember();
+                minmember = CalculateMinInclusiveCostMember(property);
                 knownMinPhysic = minmember.physic_;
             }
             var phyClone = knownMinPhysic.Clone();
@@ -448,22 +775,26 @@ namespace qpmodel.optimizer
             {
                 var phychildren = new List<PhysicNode>();
                 var logchildren = new List<LogicNode>();
-                foreach (var v in phyClone.children_)
+                for (int i = 0; i < phyClone.children_.Count; i++)
                 {
+                    var v = phyClone.children_[i];
                     // children shall be min cost
                     PhysicNode phychild;
                     if (v is PhysicMemoRef)
                     {
                         var g = (v as PhysicMemoRef).Group();
-                        phychild = g.CopyOutMinLogicPhysicPlan();
+                        PhysicProperty subprop;
+                        if (minmember != null && minmember.propertyPairs_.ContainsKey(property))
+                            subprop = minmember.propertyPairs_[property][i];
+                        else subprop = PhysicProperty.NullProperty_;
+                        phychild = g.CopyOutMinLogicPhysicPlan(subprop);
                     }
                     else
                     {
                         // this shall not happen if without join resolver. With join resolver
                         // the plan is already given, so 'v' is the known min physic node
-                        //
                         Debug.Assert(queryOpt.optimize_.memo_use_joinorder_solver_);
-                        phychild = CopyOutMinLogicPhysicPlan(v);
+                        phychild = CopyOutMinLogicPhysicPlan(property, v);
                     }
 
                     // remount the physic and logic children list
@@ -494,13 +825,19 @@ namespace qpmodel.optimizer
     {
         public SQLStatement stmt_;
         public CMemoGroup rootgroup_;
-        public PhysicProperty baseproperty_;
+        public PhysicProperty rootProperty_ = new DistrProperty();
+
         [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
         public Dictionary<LogicSignature, CMemoGroup> cgroups_ = new Dictionary<LogicSignature, CMemoGroup>();
 
         public Stack<CMemoGroup> stack_ = new Stack<CMemoGroup>();
+        public Optimizer optimizer_;
 
-        public Memo(SQLStatement stmt) => stmt_ = stmt;
+        public Memo(SQLStatement stmt, Optimizer optimizer)
+        {
+            stmt_ = stmt;
+            optimizer_ = optimizer;
+        }
         public CMemoGroup LookupCGroup(LogicNode subtree)
         {
             if (subtree is LogicMemoRef sl)
@@ -626,6 +963,31 @@ namespace qpmodel.optimizer
             }
         }
 
+        // Expressions in the same group logically shall have the same cardinality. This is not
+        // possible however if we compute CE for both AxBxC and AxCxB because the formula does 
+        // guarantee associative. So we compoute the first expression in the group and align
+        // all others to it. This is not perfect though, as the order of expression in the group
+        // actually decides the cardinalty. 
+        // 
+        public void FixGroupCardinality()
+        {
+            foreach (var v in cgroups_)
+            {
+                CMemoGroup g = v.Value;
+                Debug.Assert(g.explored_);
+
+                var exprlist = g.exprList_;
+                var firstexpr = exprlist[0].logic_;
+                var card = firstexpr.Card();
+                foreach (var e in exprlist)
+                {
+                    if (e.logic_ != null)
+                        e.logic_.card_ = card;
+                }
+                g.groupcard_ = card;
+            }
+        }
+
         public string Print()
         {
             var str = "\nMemo:\n";
@@ -647,7 +1009,6 @@ namespace qpmodel.optimizer
             str += $"Summary: {tlogics},{tphysics}";
             return str;
         }
-
     }
 
     public class Optimizer
@@ -655,29 +1016,57 @@ namespace qpmodel.optimizer
         public List<Memo> memoset_ = new List<Memo>();
         public SQLStatement stmt_;
         public SelectStmt select_;
+        public List<Rule> ruleset_ = new List<Rule>(Rule.ruleset_);
 
         public Optimizer(SQLStatement stmt)
         {
             // call once
-            Rule.Init(stmt.queryOpt_);
+            Rule.Init(ref ruleset_, stmt.queryOpt_);
             stmt_ = stmt;
             select_ = stmt.ExtractSelect();
             memoset_.Clear();
         }
 
+        internal LogicNode ConvertOrder(LogicNode logicroot, Memo memo)
+        {
+            if (logicroot is LogicOrder order)
+            {
+                memo.rootProperty_ = new SortOrderProperty(order.orders_, order.descends_);
+                return order.child_();
+            }
+            else return logicroot;
+        }
+        internal LogicNode RemoveDataExchange(LogicNode logic)
+        {
+            var children = new List<LogicNode>();
+            logic.children_.ForEach(x =>
+            {
+                if (x is LogicRemoteExchange)
+                    children.Add(x.child_());
+                else
+                    children.Add(x);
+            });
+            logic.children_ = children;
+            logic.children_.ForEach(x => RemoveDataExchange(x));
+            if (logic is LogicRemoteExchange) return logic.child_();
+            else return logic;
+        }
         public void ExploreRootPlan(SQLStatement stmt, bool enqueueit = true)
         {
             var select = stmt.ExtractSelect();
 
             // each statement sitting in a new memo
-            var memo = new Memo(select);
+            var memo = new Memo(select, this);
             if (enqueueit)
             {
                 memoset_.Add(memo);
 
                 // the statment shall already have plan generated
                 var logicroot = select.logicPlan_;
-                memo.rootgroup_ = memo.EnquePlan(logicroot);
+                // remove all remote exchange nodes
+                logicroot = RemoveDataExchange(logicroot);
+                // convert top order node to requirement and extract root node
+                memo.rootgroup_ = memo.EnquePlan(ConvertOrder(logicroot, memo));
             }
 
             // enqueue the subqueries: fromquery are excluded because different from 
@@ -699,11 +1088,7 @@ namespace qpmodel.optimizer
                 group.ExploreGroup(memo);
             }
 
-            // propagate the base property from top, 
-            // also propagate the new properties required by the member nodes
-            if (enqueueit)
-                memo.rootgroup_?.PropagateProperty(memo.baseproperty_);
-
+            memo.FixGroupCardinality();
             memo.ValidateMemo();
         }
 
@@ -713,7 +1098,7 @@ namespace qpmodel.optimizer
 
             // retrieve the lowest cost plan
             Debug.Assert(stmt.physicPlan_ is null);
-            stmt.physicPlan_ = memo.rootgroup_.CopyOutMinLogicPhysicPlan();
+            stmt.physicPlan_ = memo.rootgroup_.CopyOutMinLogicPhysicPlan(memo.rootProperty_);
             stmt.logicPlan_ = stmt.physicPlan_.logic_;
 
             // fix fromQueries - the fromQueries are optimized as part of LogicNode tree
@@ -766,6 +1151,106 @@ namespace qpmodel.optimizer
             string str = "";
             memoset_.ForEach(x => str += x.Print());
             return str;
+        }
+
+        public void RegisterMemos()
+        {
+            SysMemo.memos_.AddRange(memoset_);
+        }
+    }
+
+    public static class SysMemo
+    {
+        static public List<Memo> memos_ = new List<Memo>();
+    }
+    public static class SysMemoExpr
+    {
+
+        static public int nCols_;
+        static public string name_ = "sys_memo_expr";
+        public static List<ColumnDef> GetSchema()
+        {
+            int id = 0;
+            var cols = new List<ColumnDef> {
+                new ColumnDef("exprid", new VarCharType(64), id++),
+                new ColumnDef("nproperties", new IntType(), id++),
+                new ColumnDef("expr", new VarCharType(1024), id++) };
+            nCols_ = id;
+            return cols;
+        }
+
+        // <id int>,<>
+        public static List<Row> GetHeapRows()
+        {
+            List<Row> results = new List<Row>();
+            foreach (var memo in SysMemo.memos_)
+            {
+                int groupid = 0;
+                foreach (var (sig, g) in memo.cgroups_)
+                {
+                    groupid++;
+                    int exprid = 0;
+                    foreach (var e in g.exprList_)
+                    {
+                        Row r = new Row(nCols_);
+                        r[0] = $"{g.memoid_}.{groupid}.{exprid++}";
+                        r[1] = e.propertyPairs_.Count;
+                        r[2] = e.ToString();
+
+                        results.Add(r);
+                    }
+                }
+            }
+            return results;
+        }
+    }
+
+    public static class SysMemoProperty
+    {
+        static public List<Memo> memos_ = new List<Memo>();
+
+        static public int nCols_;
+        static public string name_ = "sys_memo_property";
+        public static List<ColumnDef> GetSchema()
+        {
+            int id = 0;
+            var cols = new List<ColumnDef> {
+                new ColumnDef("exprid", new VarCharType(64), id++),
+                new ColumnDef("propertyid", new IntType(), id++),
+                new ColumnDef("pprovide", new VarCharType(1024), id++),
+                new ColumnDef("prequire", new VarCharType(1024), id++) };
+            nCols_ = id;
+            return cols;
+        }
+
+        // <id int>,<>
+        public static List<Row> GetHeapRows()
+        {
+            List<Row> results = new List<Row>();
+            foreach (var memo in SysMemo.memos_)
+            {
+                int groupid = 0;
+                foreach (var (sig, g) in memo.cgroups_)
+                {
+                    groupid++;
+                    int exprid = 0;
+                    foreach (var e in g.exprList_)
+                    {
+                        int propertyid = 0;
+                        foreach (var (provide, require) in e.propertyPairs_)
+                        {
+                            Row r = new Row(nCols_);
+                            r[0] = $"{g.memoid_}.{groupid}.{exprid++}";
+                            r[1] = propertyid++;
+                            r[2] = provide.ToString();
+                            r[3] = require.ToString();
+
+                            results.Add(r);
+                        }
+                    }
+                }
+            }
+            return results;
         }
     }
 }

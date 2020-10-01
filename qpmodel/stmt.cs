@@ -91,6 +91,7 @@ namespace qpmodel.logic
 
         public virtual List<Row> Exec()
         {
+            ExprSearch.Reset();
             Bind(null);
             CreatePlan();
             SubstitutionOptimize();
@@ -116,20 +117,22 @@ namespace qpmodel.logic
             ExecContext context = CreateExecContext();
             if (this is SelectStmt select)
                 select.OpenSubQueries(context);
+
             finalplan.Open(context);
-            var code = context.code_;
-            code += finalplan.Exec(null);
-            code += finalplan.Close();
+            finalplan.Exec(null);
+            finalplan.Close();
 
             if (queryOpt_.optimize_.use_codegen_)
             {
-                CodeWriter.WriteLine(code);
+                CodeWriter.WriteLine(context.code_);
                 Compiler.Run(Compiler.Compile(), this, context);
             }
             if (queryOpt_.explain_.mode_ >= ExplainMode.analyze)
-            {
                 Console.WriteLine(physicPlan_.Explain(queryOpt_.explain_));
-            }
+
+            if (context is DistributedContext dc)
+                dc.machines_.WaitForAllThreads();
+
             return finalplan.rows_;
         }
 
@@ -157,7 +160,7 @@ namespace qpmodel.logic
             }
             catch (Exception e)
             {
-                // supress two known possible expected exceptions
+                // supress three known possible expected exceptions
                 if (e is AntlrParserException ||
                     e is SemanticAnalyzeException ||
                     e is SemanticExecutionException)
@@ -516,7 +519,7 @@ namespace qpmodel.logic
             var converted = new List<Expr>();
             list.ForEach(x =>
             {
-                if (x is LiteralExpr xl && xl.type_ is IntType)
+                if (x is ConstExpr xl && xl.type_ is IntType)
                 {
                     // clone is not necessary but we have some assertions to check
                     // redundant processing, say same colexpr bound twice, I'd rather
@@ -621,15 +624,19 @@ namespace qpmodel.logic
                     List<Expr> andlist = new List<Expr>();
                     var filterexpr = filter.filter_;
 
-                    // if it is a constant true filer, remove it. If a false filter, we leave 
-                    // it there - shall we try hard to stop query early? Nope, it is no deserved
-                    // to poke around for this corner case.
-                    //
+                    // if it is a constant true filer, remove it.
+                    // Reason for pushing a false filter.
+                    // One of the expression normalization rules replaces terms like
+                    // COL > NULL, COL < NULL COL <> NULL with a FALSE term
+                    // and this way it is possible to have the whole of the WHERE
+                    // reduced to WHERE FALSE.
+                    // Pushing down this false filter may help optimizer completely
+                    // eliminate an intermediate query node.
                     var isConst = filterexpr.FilterIsConst(out bool trueOrFalse);
                     if (isConst)
                     {
                         if (!trueOrFalse)
-                            andlist.Add(LiteralExpr.MakeLiteralBool(false));
+                            andlist.Add(ConstExpr.MakeConstBool(false));
                         else
                             Debug.Assert(andlist.Count == 0);
                     }
@@ -640,9 +647,8 @@ namespace qpmodel.logic
                         andlist.RemoveAll(e =>
                         {
                             var isConst = e.FilterIsConst(out bool trueOrFalse);
-                            if (isConst)
+                            if (isConst && trueOrFalse)
                             {
-                                Debug.Assert(trueOrFalse);
                                 return true;
                             }
                             return pushdownFilter(plan, e, pushJoinFilter);
@@ -678,7 +684,7 @@ namespace qpmodel.logic
         {
             var ret = new List<NamedQuery>();
             Debug.Assert(subQueries_.Count >=
-                    fromQueries_.Count + decorrelatedSubs_.Count);
+                fromQueries_.Count + decorrelatedSubs_.Count);
             if (excludeFromAndDecorrelated)
             {
                 foreach (var x in subQueries_)
@@ -906,10 +912,10 @@ namespace qpmodel.logic
             Console.WriteLine(physicPlan_.Explain());
 
             finalplan.ValidateThis();
+
             finalplan.Open(context);
-            var code = context.code_;
-            code += finalplan.Exec(null);
-            code += finalplan.Close();
+            finalplan.Exec(null);
+            finalplan.Close();
 
             return finalplan.rows_;
         }

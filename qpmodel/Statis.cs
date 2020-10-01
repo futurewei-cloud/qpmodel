@@ -30,21 +30,17 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Diagnostics;
-using qpmodel;
 using qpmodel.expr;
 using qpmodel.logic;
 using qpmodel.physic;
-using qpmodel.sqlparser;
 
 using Value = System.Object;
-using TableColumn = System.Tuple<string, string>;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace qpmodel.stat
 {
-    class StatConst
+    public class StatConst
     {
         public const double zero_ = 0.000000001;
         public const double one_ = 1.0;
@@ -77,7 +73,81 @@ namespace qpmodel.stat
 
         public double depth_ { get; set; }
         public int nbuckets_ { get; set; }
-        public Value[] buckets_ { get; set; } = new Value[NBuckets_ + 1];
+        public Value[] buckets_ { get; set; } = new Value[NBuckets_];
+
+        // Given min, max, construct histgram for discrete or continous domains
+        //
+        static void constructDomain<T>(bool isDiscrete, Historgram hist, dynamic min, dynamic max, ulong nrows)
+        {
+            int nbuckets = NBuckets_;
+            dynamic width;
+            if (isDiscrete)
+            {
+                // given [0, 2], we have 3 integers between thus 3 buckets are enough
+                var nvals = max - min + 1;
+                if (nvals < NBuckets_)
+                    nbuckets = nvals;
+                width = ((decimal)nvals) / nbuckets;
+                Debug.Assert((decimal)width >= 1);
+            }
+            else
+            {
+                // use default number of buckets for continous fields
+                var diff = max - min;
+                width = diff / (nbuckets - 1);
+            }
+
+            // in case nrows is small, say (min, max, nrows) = (1000, 20000, 3), depth_ will be
+            // small and this shall not affect histgram's correctness.
+            //
+            Debug.Assert(nbuckets > 0 && nbuckets <= NBuckets_);
+            for (int i = 0; i < nbuckets; i++)
+                hist.buckets_[i] = (T)(min + (width * i));
+            hist.nbuckets_ = nbuckets;
+            hist.depth_ = ((double)nrows) / hist.nbuckets_;
+        }
+
+        public static Historgram ConstructFromMinMax(dynamic min, dynamic max, ulong nrows)
+        {
+            Historgram hist = new Historgram();
+            switch (min)
+            {
+                case int intmin:
+                    Debug.Assert(max is int);
+                    constructDomain<int>(true, hist, min, max, nrows);
+                    break;
+                case long longmin:
+                    Debug.Assert(max is long);
+                    constructDomain<long>(true, hist, min, max, nrows);
+                    break;
+                case DateTime datemin:
+                    Debug.Assert(max is DateTime);
+                    // Notes: Planck disagrees DateTime not discrete
+                    constructDomain<DateTime>(false, hist, min, max, nrows);
+                    break;
+                case float floatmin:
+                    Debug.Assert(max is float);
+                    constructDomain<float>(false, hist, min, max, nrows);
+                    break;
+                case double doublemin:
+                    Debug.Assert(max is double);
+                    constructDomain<double>(false, hist, min, max, nrows);
+                    break;
+                case decimal decmin:
+                    Debug.Assert(max is decimal);
+                    constructDomain<decimal>(false, hist, min, max, nrows);
+                    break;
+                default:
+                    // this data type is not supported
+                    return null;
+            }
+
+            // sanity checks
+            Debug.Assert(hist.nbuckets_ >= 1);
+            if (hist.nbuckets_ < NBuckets_)
+                Debug.Assert(hist.buckets_[hist.nbuckets_] is null);
+            return hist;
+        }
 
         int whichBucketLargerThan(Value val)
         {
@@ -85,7 +155,7 @@ namespace qpmodel.stat
 
             if (((dynamic)buckets_[0]).CompareTo(value) >= 0)
                 return 0;
-            for (int i = 0; i <= nbuckets_; i++)
+            for (int i = 0; i < nbuckets_; i++)
             {
                 // get the upper bound
                 dynamic bound = buckets_[i];
@@ -276,7 +346,8 @@ namespace qpmodel.stat
                 foreach (var g in groups)
                     sortgroup.Add(g.Key, g.Count());
 
-                var sorted = from pair in sortgroup orderby pair.Value descending select pair;
+                // use top 100 values to calculate frequency, ensure that pairs are sorted in a fixed order.
+                var sorted = from pair in sortgroup orderby pair.Value descending, pair.Key descending select pair;
                 mcv_.nvalues_ = (int)Math.Min(n_distinct_, MCVList.NValues_);
 
                 int i = 0;
@@ -316,7 +387,7 @@ namespace qpmodel.stat
                 Debug.Assert(depth >= 1);
 
                 hist_ = new Historgram();
-                for (int i = 0; i < nbuckets + 1; i++)
+                for (int i = 0; i < nbuckets; i++)
                     hist_.buckets_[i] = values[Math.Min((int)(i * depth), values.Count - 1)];
                 hist_.depth_ = depth;
                 hist_.nbuckets_ = nbuckets;
@@ -415,9 +486,9 @@ namespace qpmodel.stat
 
             if (filter is BinExpr pred)
             {
-                if (pred.l_() is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
+                if (pred.lchild_() is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
                 {
-                    if (pred.r_() is LiteralExpr pr)
+                    if (pred.rchild_() is ConstExpr pr)
                     {
                         // a.a1 >= <const>
                         var stat = Catalog.sysstat_.GetColumnStat(bpl.relname_, pl.colName_);
@@ -434,7 +505,7 @@ namespace qpmodel.stat
                     var stat = Catalog.sysstat_.GetColumnStat(bpl.relname_, pl.colName_);
                     for (int i = 1; i < inPred.children_.Count; ++i)
                     {
-                        if (inPred.children_[i] is LiteralExpr pr)
+                        if (inPred.children_[i] is ConstExpr pr)
                             selectivity += stat.EstSelectivity("=", pr.val_);
                     }
                     selectivity = Math.Min(1.0, selectivity);
@@ -453,8 +524,8 @@ namespace qpmodel.stat
         static ColExpr ExtractColumn(Expr filter)
         {
             if (filter is BinExpr pred)
-                if (pred.l_() is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
-                    if (pred.r_() is LiteralExpr pr && new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(pred.op_))
+                if (pred.lchild_() is ColExpr pl && pl.tabRef_ is BaseTableRef bpl)
+                    if (pred.rchild_() is ConstExpr pr && new List<String>() { "=", ">", ">=", "<", "<=" }.Contains(pred.op_))
                         return pl;
             return null;
         }
@@ -691,19 +762,17 @@ namespace qpmodel.stat
             stats_ = Catalog.sysstat_.GetOrCreateTableStats(tabName);
         }
 
-        public override string Exec(Func<Row, string> callback)
+        public override void Exec(Action<Row> callback)
         {
             List<Row> samples = new List<Row>();
             child_().Exec(r =>
             {
                 samples.Add(r);
-                return null;
             });
 
             // TODO: we may consider using a SQL statement to do this
             //  select count(*), count(distint a1), count(distinct a2), build_historgram(a1), ...
             Catalog.sysstat_.ComputeStats(samples, stats_);
-            return null;
         }
     }
 }

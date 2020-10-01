@@ -56,8 +56,11 @@ namespace qpmodel.logic
             // optimizer controls
             public bool enable_hashjoin_ { get; set; } = true;
             public bool enable_nljoin_ { get; set; } = true;
+            public bool enable_streamagg_ { get; set; } = false;
             public bool enable_indexseek_ { get; set; } = true;
+            public bool enable_broadcast_ { get; set; } = true;
             public bool use_memo_ { get; set; } = true;
+            public bool memo_use_remoteexchange_ { get; set; } = false;
             public bool memo_disable_crossjoin_ { get; set; } = true;
             public bool memo_use_joinorder_solver_ { get; set; } = false;   // make it true by default
 
@@ -197,10 +200,14 @@ namespace qpmodel.logic
                     if (exp_showactual)
                     {
                         var profile = phynode.profile_;
-                        if (profile.nloops_ == 1 || profile.nloops_ == 0)
+                        var loops = profile.nloops_;
+                        if (loops == 1 || loops == 0)
+                        {
+                            Debug.Assert(loops != 0 || profile.nrows_ == 0);
                             r += $" (actual rows={profile.nrows_})";
+                        }
                         else
-                            r += $" (actual rows={profile.nrows_ / profile.nloops_}, loops={profile.nloops_})";
+                            r += $" (actual rows={profile.nrows_ / loops}, loops={loops})";
                     }
                 }
                 r += "\n";
@@ -232,19 +239,6 @@ namespace qpmodel.logic
                     children_.ForEach(x => r += x.Explain(option, depth));
             }
 
-            // details of distributed query emulation
-            if (this is PhysicGather)
-            {
-                int nthreads = QueryOption.num_machines_;
-                int nshuffle = 0;
-                VisitEach(x =>
-                {
-                    if (x is PhysicRedistribute || x is PhysicBroadcast)
-                        nshuffle++;
-                });
-                r += $"\nEmulated {QueryOption.num_machines_} machines distributed run " +
-                     $"with {nthreads * (1 + nshuffle)} threads\n";
-            }
             return r;
         }
 
@@ -326,7 +320,7 @@ namespace qpmodel.logic
 
         // from clause -
         //  pair each from item with cross join, their join conditions will be handled
-        //  with where clauss processing.
+        //  with where clause processing.
         //
         LogicNode transformFromClause()
         {
@@ -424,16 +418,33 @@ namespace qpmodel.logic
             // shape with main queyr not distributed but subquery is.
             //
             bool hasdtable = false;
-            from_.ForEach(x => hasdtable |=
-                (x is BaseTableRef bx && bx.IsDistributed()));
+            bool onlyreplicated = true;
+            from_.ForEach(x =>
+            {
+                if (x is BaseTableRef bx)
+                {
+                    var method = bx.Table().distMethod_;
+                    if (bx.IsDistributed())
+                    {
+                        hasdtable = true;
+                        if (method != TableDef.DistributionMethod.Replicated)
+                            onlyreplicated = false;
+                    }
+                }
+            });
             if (hasdtable)
             {
                 Debug.Assert(!distributed_);
                 distributed_ = true;
 
-                // FIXME: we have to disable memo optimization before property enforcement done
-                queryOpt_.optimize_.use_memo_ = false;
-                root = new LogicGather(root);
+                // distributed table query can also use memo
+                // remote exchange is considered in memo optimization
+                queryOpt_.optimize_.memo_use_remoteexchange_ = true;
+
+                if (onlyreplicated)
+                    root = new LogicGather(root, new List<int> { 0 });
+                else
+                    root = new LogicGather(root);
             }
 
             return root;
@@ -464,7 +475,7 @@ namespace qpmodel.logic
             if (newfilter.Count > 0)
                 return newfilter.AndListToExpr();
             else
-                return new LiteralExpr("true", new BoolType());
+                return new ConstExpr("true", new BoolType());
         }
 
         public override LogicNode CreatePlan()
@@ -519,7 +530,7 @@ namespace qpmodel.logic
                     root = new LogicFilter(root, where_);
                 else
                     lr.filter_ = lr.filter_.AddAndFilter(where_);
-                if (where_ != null && where_.HasAggFunc())
+                if (where_.HasAggFunc())
                 {
                     where_ = moveFilterToInsideAggNode(root, where_);
                     root = new LogicFilter(root.child_(), where_);
@@ -620,18 +631,20 @@ namespace qpmodel.logic
         {
             byList = replaceOutputNameToExpr(byList);
             byList = seq2selection(byList, selection_);
+            List<Expr> newByList = new List<Expr>();
             byList.ForEach(x =>
             {
                 if (!x.bounded_)        // some items already bounded with seq2selection()
-                    x.Bind(context);
+                    x = x.BindAndNormalize(context);
+                newByList.Add(x);
             });
             if (queryOpt_.optimize_.remove_from_)
             {
-                for (int i = 0; i < byList.Count; i++)
-                    byList[i] = byList[i].DeQueryRef();
+                for (int i = 0; i < newByList.Count; i++)
+                    newByList[i] = newByList[i].DeQueryRef();
             }
 
-            return byList;
+            return newByList;
         }
 
         List<Expr> bindSelectionList(BindContext context)
@@ -649,10 +662,9 @@ namespace qpmodel.logic
                 }
                 else
                 {
-                    x.Bind(context);
+                    x = x.BindAndNormalize(context);
                     if (x.HasAggFunc())
                         hasAgg_ = true;
-                    x = x.ConstFolding();
                     if (queryOpt_.optimize_.remove_from_)
                         x = x.DeQueryRef();
                     newselection.Add(x);
@@ -679,13 +691,14 @@ namespace qpmodel.logic
             bindFrom(context);
 
             selection_ = bindSelectionList(context);
+
             if (where_ != null)
             {
-                where_.Bind(context);
+                where_ = where_.BindAndNormalizeClause(context);
                 where_ = where_.FilterNormalize();
                 if (!where_.IsBoolean() || where_.HasAggFunc())
                     throw new SemanticAnalyzeException(
-                        "WHERE condition must be a blooean expression and no aggregation is allowed");
+                        "WHERE condition must be a boolean expression and no aggregation is allowed");
                 if (queryOpt_.optimize_.remove_from_)
                     where_ = where_.DeQueryRef();
             }
@@ -701,7 +714,7 @@ namespace qpmodel.logic
             if (having_ != null)
             {
                 hasAgg_ = true;
-                having_.Bind(context);
+                having_ = having_.BindAndNormalize(context);
                 having_ = having_.FilterNormalize();
                 if (!having_.IsBoolean())
                     throw new SemanticAnalyzeException("HAVING condition must be a blooean expression");
@@ -739,7 +752,7 @@ namespace qpmodel.logic
                     break;
                 case JoinQueryRef jref:
                     jref.tables_.ForEach(x => bindTableRef(context, x));
-                    jref.constraints_.ForEach(x => x.Bind(context));
+                    jref.constraints_.ForEach(x => x = x.BindAndNormalize(context));
                     break;
                 default:
                     throw new NotImplementedException();
