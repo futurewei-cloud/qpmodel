@@ -28,19 +28,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Numerics;
 
 using BitVector = System.Int64;
 using LogicSignature = System.Int64;
 
-using qpmodel.utils;
 using qpmodel.logic;
 using qpmodel.physic;
-using qpmodel.optimizer;
-using qpmodel.stat;
 using qpmodel.expr;
 using qpmodel.optimizer.test;
 

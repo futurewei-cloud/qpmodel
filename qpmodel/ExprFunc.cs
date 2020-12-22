@@ -512,10 +512,15 @@ namespace qpmodel.expr
             base.Bind(context);
             type_ = new IntType();
 
-            // Try adding all tableRefs to fix count(*) being orphaned and
-            // getting pushed to random side when join transformations happen.
-            //
-            tableRefs_ = context.AllTableRefs();
+            // Add the first table in the scope as tableref of count(*)
+            // because adding all of them would make the containg expression
+            // to appear to require more than one table when that is really
+            // not the case and may lead to attempts create a join or push
+            // count(*) to both sides of an existing join.
+            // This will let count(*) to be pushed to the correct node and side.
+            List<TableRef> trefs = context.AllTableRefs();
+            if (trefs.Count > 0)
+                tableRefs_.Add(trefs[0]);
         }
 
         public override Value Init(ExecContext context, Row input)
@@ -895,7 +900,8 @@ namespace qpmodel.expr
     public partial class BinExpr : Expr
     {
         internal string op_;
-
+        internal bool isMarkerBinExpr_ = false;
+        public bool IsMarkerBinExpr() => isMarkerBinExpr_;
         public override int GetHashCode() => lchild_().GetHashCode() ^ rchild_().GetHashCode() ^ op_.GetHashCode();
         public override bool Equals(object obj)
         {
@@ -905,18 +911,19 @@ namespace qpmodel.expr
                 return exprEquals(lchild_(), bo.lchild_()) && exprEquals(rchild_(), bo.rchild_()) && op_.Equals(bo.op_);
             return false;
         }
-        public BinExpr(Expr l, Expr r, string op) : base()
+        public BinExpr(Expr l, Expr r, string op, bool isMarkerBinExpr = false) : base()
         {
             children_.Add(l);
             children_.Add(r);
             op_ = op.ToLower();
+            isMarkerBinExpr_ = isMarkerBinExpr;
             Debug.Assert(Clone().Equals(this));
         }
 
-        public static BinExpr MakeBooleanExpr(Expr l, Expr r, string op)
+        public static BinExpr MakeBooleanExpr(Expr l, Expr r, string op, bool isMarkerBinExpr = false)
         {
             Debug.Assert(l.bounded_ && r.bounded_);
-            var expr = new BinExpr(l, r, op);
+            var expr = new BinExpr(l, r, op, isMarkerBinExpr);
             expr.ResetAggregateTableRefs();
             expr.markBounded();
             expr.type_ = new BoolType();

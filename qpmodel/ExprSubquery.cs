@@ -25,16 +25,14 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Diagnostics;
-using Value = System.Object;
 
 using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.utils;
-using IronPython.Compiler.Ast;
+
+using Value = System.Object;
 
 namespace qpmodel.expr
 {
@@ -243,11 +241,18 @@ namespace qpmodel.expr
 
     public class InSubqueryExpr : SubqueryExpr
     {
+        internal bool hasNot_;
+
+        internal bool hasNull_;
         // children_[0] is the expr of in-query
         internal Expr expr_() => children_[0];
 
-        public override string ToString() => $"{expr_()} in @{subqueryid_}";
-        public InSubqueryExpr(Expr expr, SelectStmt query) : base(query) { children_.Add(expr); }
+        public override string ToString()
+        {
+            string ifnot = hasNot_ ? " not" : "";
+            return $"{expr_()}{ifnot} in @{subqueryid_}";
+        }
+        public InSubqueryExpr(Expr expr, SelectStmt query, bool hasNot) : base(query) { hasNot_ = hasNot; children_.Add(expr); }
 
         public override void Bind(BindContext context)
         {
@@ -268,7 +273,13 @@ namespace qpmodel.expr
             // is also not copied thus multiple threads may racing updating cacheVal_. Lock the
             // code section to prevent it. This also redu
             if (isCacheable_ && cachedValSet_)
-                return (cachedVal_ as HashSet<Value>).Contains(expr);
+            {
+                var hset = cachedVal_ as HashSet<Value>;
+                hasNull_ = hset.Contains(null) ? true : false;
+                var in_cache_flag = expr is null ? false : hset.Contains(expr); // null in (1,null)  false
+                // not in [.. null ..] = false
+                return hasNot_ ? (!hasNull_ && !in_cache_flag) : in_cache_flag;
+            }
 
             var set = new HashSet<Value>();
             query_.physicPlan_.Exec(l =>
@@ -277,9 +288,11 @@ namespace qpmodel.expr
                 set.Add(l[0]);
             });
 
+            hasNull_ = set.Contains(null) ? true : false;
             cachedVal_ = set;
             cachedValSet_ = true;
-            return set.Contains(expr);
+            bool in_flag = set.Contains(expr);
+            return hasNot_ ? (!hasNull_ && !in_flag) : in_flag;
         }
     }
 
@@ -288,10 +301,12 @@ namespace qpmodel.expr
     //
     public class InListExpr : Expr
     {
+        internal bool hasNot_;
         internal Expr expr_() => children_[0];
         internal List<Expr> inlist_() => children_.GetRange(1, children_.Count - 1);
-        public InListExpr(Expr expr, List<Expr> inlist)
+        public InListExpr(Expr expr, List<Expr> inlist, bool hasNot)
         {
+            hasNot_ = hasNot;
             children_.Add(expr); children_.AddRange(inlist);
             type_ = new BoolType();
             Debug.Assert(Clone().Equals(this));
@@ -317,17 +332,24 @@ namespace qpmodel.expr
                 return null;
             List<Value> inlist = new List<Value>();
             inlist_().ForEach(x => { inlist.Add(x.Exec(context, input)); });
-            return inlist.Exists(v.Equals);
+
+            // postgreSQL saw NULL as any posible value
+            // i.e. not in (null) is false
+            var hasNull_ = inlist.Exists(x => x is null);
+
+            var in_flag = inlist.Exists(v.Equals);
+            return hasNot_ ? (!hasNull_ && !in_flag) : in_flag;
         }
 
         public override string ToString()
         {
             var inlist = inlist_();
+            string ifnot = hasNot_ ? " not" : "";
             if (inlist_().Count < 5)
-                return $"{expr_()} in ({string.Join(",", inlist)})";
+                return $"{expr_()}{ifnot} in ({string.Join(",", inlist)})";
             else
             {
-                return $"{expr_()} in ({string.Join(",", inlist.GetRange(0, 3))}, ... <Total: {inlist.Count}> )";
+                return $"{expr_()}{ifnot} in ({string.Join(",", inlist.GetRange(0, 3))}, ... <Total: {inlist.Count}> )";
             }
         }
     }

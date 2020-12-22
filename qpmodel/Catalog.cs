@@ -29,20 +29,16 @@ using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Collections.Generic;
-using System.IO;
 using System.Globalization;
 using System.Threading;
 
 using qpmodel.stat;
-using qpmodel.sqlparser;
 using qpmodel.utils;
 using qpmodel.expr;
 using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.index;
-using qpmodel.test;
 
-using TableColumn = System.Tuple<string, string>;
 using qpmodel.optimizer;
 
 namespace qpmodel
@@ -72,6 +68,11 @@ namespace qpmodel
 
     public class TableDef
     {
+        public enum TableSource
+        {
+            Table,
+            Stream,
+        }
         public enum DistributionMethod
         {
             NonDistributed,
@@ -79,6 +80,7 @@ namespace qpmodel
             Replicated,
             Roundrobin
         }
+        public TableSource source_ = TableSource.Table;
         public string name_;
         public Dictionary<string, ColumnDef> columns_;
         public DistributionMethod distMethod_ = DistributionMethod.NonDistributed;
@@ -88,12 +90,13 @@ namespace qpmodel
         // emulated storage across multiple machines: replicated or distributed
         public List<Distribution> distributions_ = new List<Distribution>();
 
-        public TableDef(string tabName, List<ColumnDef> columns, string distributedBy)
+        public TableDef(TableSource source, string tabName, List<ColumnDef> columns, string distributedBy)
         {
             int npart = 1;
             Dictionary<string, ColumnDef> cols = new Dictionary<string, ColumnDef>();
             foreach (var c in columns)
                 cols.Add(c.name_, c);
+            source_ = source;
             name_ = Utils.normalizeName(tabName);
             columns_ = cols;
             Debug.Assert(distMethod_ == DistributionMethod.NonDistributed);
@@ -159,7 +162,7 @@ namespace qpmodel
 
     public class SystemTable
     {
-    };
+    }
 
     // format: tableName:key, list of <ColName: Key, Column definition>
     public class SysTable : SystemTable
@@ -170,8 +173,15 @@ namespace qpmodel
         {
             tabName = Utils.normalizeName(tabName);
             records_.Add(tabName,
-                new TableDef(tabName, columns, distributedBy));
+                new TableDef(TableDef.TableSource.Table, tabName, columns, distributedBy));
         }
+        public void CreateStream(string tabName, List<ColumnDef> columns, string distributedBy = null)
+        {
+            tabName = Utils.normalizeName(tabName);
+            records_.Add(tabName,
+                new TableDef(TableDef.TableSource.Stream, tabName, columns, distributedBy));
+        }
+
         public void DropTable(string tabName)
         {
             records_.Remove(tabName);
@@ -266,14 +276,15 @@ namespace qpmodel
                 @"create table arb (a1 int, a2 int, a3 int, a4 int) roundrobin;",
                 @"create table brb (b1 int, b2 int, b3 int, b4 int) roundrobin;",
                 // steaming tables
-                @"create table ast (a0 datetime, a1 int, a2 int, a3 int, a4 int);",
+                @"create table ast (a0 datetime, a1 int, a2 int, a3 int, a4 int);",     // bounded table with ts
+                @"create stream ainf (a0 datetime, a1 int, a2 int, a3 int, a4 int);",   // unbounded table
             };
             SQLStatement.ExecSQLList(string.Join("", createtables));
 
             // load tables
             var appbin_dir = AppContext.BaseDirectory.Substring(0, AppContext.BaseDirectory.LastIndexOf("bin"));
             var folder = $@"{appbin_dir}/../data";
-            var tables = new List<string>() { "test", "a", "b", "c", "d", "r", "ad", "bd", "cd", "dd", "ar", "br", "arb", "brb", "ast" };
+            var tables = new List<string>() { "test", "a", "b", "c", "d", "r", "ad", "bd", "cd", "dd", "ar", "br", "arb", "brb", "ast"};
             foreach (var v in tables)
             {
                 string filename = $@"'{folder}/{v}.tbl'";

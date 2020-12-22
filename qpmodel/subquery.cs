@@ -28,14 +28,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Diagnostics;
-using Value = System.Object;
 
 using qpmodel.expr;
 using qpmodel.physic;
-using qpmodel.utils;
+
+using Value = System.Object;
 
 // To remove FromQuery, we essentially remove all references to the related 
 // FromQueryRef, which shall include selection (ColExpr, Aggs, Orders etc),
@@ -57,8 +55,11 @@ namespace qpmodel.logic
 {
     public class MarkerExpr : Expr
     {
-        public MarkerExpr()
+        public int subqueryid_;
+        public MarkerExpr(List<TableRef> tr, int subqueryid)
         {
+            subqueryid_ = subqueryid;
+            tableRefs_ = tr;
             Debug.Assert(Equals(Clone()));
             dummyBind();
         }
@@ -69,7 +70,7 @@ namespace qpmodel.logic
             return null;
         }
 
-        public override string ToString() => $"#marker";
+        public override string ToString() => $"#marker@{subqueryid_}";
     }
 
     public partial class SelectStmt : SQLStatement
@@ -91,10 +92,29 @@ namespace qpmodel.logic
         //
         // further convert DJoin to semi-join here is by decorrelate process
         //
-        LogicNode existsToMarkJoin(LogicNode nodeA, ExistSubqueryExpr existExpr)
+
+        // check (@1 or (@2 or @3))) if @3 unnested here.
+        // (@1 @2)
+        bool hasAnyExtraSubqueryExprInOR(Expr x, Expr exsitsExpr)
         {
-            var nodeAIsOnMarkJoin =
-                nodeA is LogicFilter && (nodeA.child_() is LogicMarkJoin || nodeA.child_() is LogicSingleJoin);
+            bool exprIsNotEqualToCurrentExistsExpr(Expr x, Expr curExistsExpr)
+            {
+                return x is SubqueryExpr && (!x.Equals(curExistsExpr));
+            }
+            if (x is LogicOrExpr xOR)
+                return hasAnyExtraSubqueryExprInOR(xOR.rchild_(), exsitsExpr) || hasAnyExtraSubqueryExprInOR(xOR.lchild_(), exsitsExpr);
+            else
+                return x.VisitEachExists(y => exprIsNotEqualToCurrentExistsExpr(y, exsitsExpr));
+        }
+
+        // If there is OR in the predicate, can't turn into a filter
+        //
+        LogicNode existsToMarkJoin(LogicNode nodeA, ExistSubqueryExpr existExpr, ref bool canReplace)
+        {
+            bool exprIsNotORExprAndEqualsToExistExpr(Expr x, Expr existExpr)
+            {
+                return (!(x is LogicOrExpr)) && x.Equals(existExpr);
+            }
 
             // nodeB contains the join filter
             var nodeB = existExpr.query_.logicPlan_;
@@ -103,51 +123,103 @@ namespace qpmodel.logic
 
             // nullify nodeA's filter: the rest is push to top filter. However,
             // if nodeA is a Filter|MarkJoin, keep its mark filter.
-            var markerFilter = new ExprRef(new MarkerExpr(), 0);
+            var markerFilter = new ExprRef(new MarkerExpr(nodeBFilter.tableRefs_, existExpr.subqueryid_), 0);
             var nodeAFilter = nodeA.filter_;
-            if (nodeAIsOnMarkJoin)
-                nodeA.filter_ = markerFilter;
+            Debug.Assert(!(nodeA is null));
+
+            // a1 > @1 and a2 > @2 and a3 > 2, existExpr = @1
+            //   keeplist: a1 > @1 and a3 > 2
+            //   andlist after removal: a2 > @2
+            //   nodeAFilter = a1 > @1 and a3 > 2
+            //   consider a1>0 and (@1 or @2)
+            //   a1>0 and (@1 or (@2 and @3)) 
+
+            //(@1 or marker@2) and marker@3 existExpr = @1
+            //   keep list (@1 or marker@2)
+            //   andlist after remove @3
+            //   nodeAFilter = (@1 or marker@2)
+            var andlist = nodeAFilter.FilterToAndList();
+            var keeplist = andlist.Where(x => x.VisitEachExists(e => e.Equals(existExpr))).ToList();
+            andlist.RemoveAll(x => exprIsNotORExprAndEqualsToExistExpr(x, existExpr) ||
+                            ((x is LogicOrExpr) && !hasAnyExtraSubqueryExprInOR(x, existExpr)));
+
+            // if there is any (#marker@1 or @2), the root should be replace, 
+            // i.e. the (#marker@1 or @2)  keeps at the top for farther unnesting
+            canReplace = andlist.Find(x => (x is LogicOrExpr) && hasAnyExtraSubqueryExprInOR(x, existExpr)) == null ? false : true;
+
+            if (andlist.Count == 0 || canReplace)
+                // nodeA is root, a ref parameter. (why it is a ref parameter without "ref" or "out" )
+                nodeA.NullifyFilter();
             else
             {
-                if (nodeAFilter != null)
-                {
-                    // a1 > @1 and a2 > @2 and a3 > 2, scalarExpr = @1
-                    //   keeplist: a1 > @1 and a3 > 2
-                    //   andlist after removal: a2 > @2
-                    //   nodeAFilter = a1 > @1 and a3 > 2
-                    //
-                    var andlist = nodeAFilter.FilterToAndList();
-                    var keeplist = andlist.Where(x => x.VisitEachExists(e => e.Equals(existExpr))).ToList();
-                    andlist.RemoveAll(x => x.VisitEachExists(e => e.Equals(existExpr)));
-                    if (andlist.Count == 0)
-                        nodeA.NullifyFilter();
-                    else
-                    {
-                        nodeA.filter_ = andlist.AndListToExpr();
-                        if (keeplist.Count > 0)
-                            nodeAFilter = keeplist.AndListToExpr();
-                        else
-                            nodeAFilter = markerFilter;
-                    }
-                }
+                nodeA.filter_ = andlist.AndListToExpr();
+                nodeAFilter = keeplist.Count > 0 ? keeplist.AndListToExpr() : markerFilter;
             }
+
             // make a mark join
             LogicMarkJoin markjoin;
             if (existExpr.hasNot_)
-                markjoin = new LogicMarkAntiSemiJoin(nodeA, nodeB);
+                markjoin = new LogicMarkAntiSemiJoin(nodeA, nodeB, existExpr.subqueryid_);
             else
-                markjoin = new LogicMarkSemiJoin(nodeA, nodeB);
+                markjoin = new LogicMarkSemiJoin(nodeA, nodeB, existExpr.subqueryid_);
 
             // make a filter on top of the mark join collecting all filters
             Expr topfilter;
-            if (nodeAIsOnMarkJoin)
-                topfilter = nodeAFilter.SearchAndReplace(existExpr, ConstExpr.MakeConstBool(true));
-            else
-                topfilter = nodeAFilter.SearchAndReplace(existExpr, markerFilter);
+            topfilter = nodeAFilter.SearchAndReplace(existExpr, markerFilter);
             nodeBFilter.DeParameter(nodeA.InclusiveTableRefs());
+
+            // find all expr contains Parameter col and move it to the toper
+            var TableRefs = nodeA.InclusiveTableRefs();
             topfilter = topfilter.AddAndFilter(nodeBFilter);
             LogicFilter Filter = new LogicFilter(markjoin, topfilter);
+            var notDeparameterExpr = findAndfetchParameterExpr(ref nodeA);
+            if (notDeparameterExpr.Count > 0)
+            {
+                topfilter = notDeparameterExpr.AndListToExpr();
+                Filter = new LogicFilter(Filter, topfilter);
+            }
             return Filter;
+        }
+
+        List<Expr> findAndfetchParameterExpr(ref LogicNode nodeA)
+        {
+            bool isUnresolvedColExpr(Expr e)
+            {
+                return e is ColExpr eCE && eCE.isParameter_;
+            }
+            List<Expr> notDeparameterExpr = new List<Expr>();
+
+            nodeA.VisitEach(x =>
+            {
+                if (x is LogicFilter)
+                {
+                    var andList = x.filter_.FilterToAndList();
+                    foreach (var e in andList)
+                    {
+                        e.VisitEach(c =>
+                        {
+                            if (isUnresolvedColExpr(c))
+                                notDeparameterExpr.Add(e);
+                        });
+                    }
+                    var removeList = notDeparameterExpr.Where(x => andList.Contains(x));
+                    foreach (var r in removeList)
+                    {
+                        andList.Remove(r);
+                    }
+                    if (andList.Count == 0)
+                        x.NullifyFilter();
+                    else
+                        x.filter_ = andList.AndListToExpr();
+                }
+            });
+
+            if (notDeparameterExpr.Count > 0)
+            {
+                notDeparameterExpr.Distinct();
+            }
+
+            return notDeparameterExpr;
         }
 
         // expands scalar subquery filter to mark join
@@ -213,6 +285,73 @@ namespace qpmodel.logic
                 }
             });
             return newplan;
+        }
+
+        Expr extractCurINExprFromNodeAFilter(LogicNode nodeA, InSubqueryExpr curInExpr, ExprRef markerFilter)
+        {
+            var nodeAFilter = nodeA.filter_;
+            if (nodeAFilter != null)
+            {
+                // a1 > @1 and a2 > @2 and a3 > 2, scalarExpr = @1
+                //   keeplist: a1 > @1 and a3 > 2
+                //   andlist after removal: a2 > @2
+                //   nodeAFilter = a1 > @1 and a3 > 2
+                //
+                var andlist = nodeAFilter.FilterToAndList();
+                var keeplist = andlist.Where(x => x.VisitEachExists(e => e.Equals(curInExpr))).ToList();
+                andlist.RemoveAll(x => x.VisitEachExists(e => e.Equals(curInExpr)));
+                if (andlist.Count == 0)
+                    nodeA.NullifyFilter();
+                else
+                {
+                    nodeA.filter_ = andlist.AndListToExpr();
+                    if (keeplist.Count > 0)
+                        nodeAFilter = keeplist.AndListToExpr();
+                    else
+                        nodeAFilter = markerFilter;
+                }
+            }
+            return nodeAFilter;
+        }
+
+        LogicNode inToMarkJoin(LogicNode planWithSubExpr, InSubqueryExpr inExpr)
+        {
+            LogicNode nodeA = planWithSubExpr;
+
+            // nodeB contains the join filter
+            var nodeB = inExpr.query_.logicPlan_;
+            var nodeBFilter = nodeB.filter_;
+            nodeB.NullifyFilter();
+
+            // nullify nodeA's filter: the rest is push to top filter. However,
+            // if nodeA is a Filter|MarkJoin, keep its mark filter.
+            var markerFilter = new ExprRef(new MarkerExpr(nodeBFilter.tableRefs_, inExpr.subqueryid_), 0);
+            var nodeAFilter = extractCurINExprFromNodeAFilter(nodeA, inExpr, markerFilter);
+
+            // consider SQL ...a1 in select b1 from... 
+            // a1 is outerExpr and b1 is selectExpr
+            Expr outerExpr = inExpr.child_();
+            Debug.Assert(inExpr.query_.selection_.Count == 1);
+            Expr selectExpr = inExpr.query_.selection_[0];
+            BinExpr inToEqual = BinExpr.MakeBooleanExpr(outerExpr, selectExpr, "=", true);
+
+            // make a mark join
+            LogicMarkJoin markjoin;
+            if (inExpr.hasNot_)
+                markjoin = new LogicMarkAntiSemiJoin(nodeA, nodeB, inExpr.subqueryid_);
+            else
+                markjoin = new LogicMarkSemiJoin(nodeA, nodeB, inExpr.subqueryid_);
+
+            // make a filter on top of the mark join collecting all filters
+            Expr topfilter = nodeAFilter.SearchAndReplace(inExpr, markerFilter);
+            nodeBFilter.DeParameter(nodeA.InclusiveTableRefs());
+            topfilter = topfilter.AddAndFilter(nodeBFilter);
+            // TODO mutiple nested insubquery subquery 
+            // seperate the overlapping code with existsToSubquery to a new method
+            // when the PR in #support nestted exist subquery pass
+            LogicFilter Filter = new LogicFilter(markjoin, topfilter);
+            Filter = new LogicFilter(Filter, inToEqual);
+            return Filter;
         }
 
         // A Xs B => A LOJ B if max1row is assured
@@ -396,8 +535,8 @@ namespace qpmodel.logic
 
         // exists|quantified subquery => mark join
         // scalar subquery => single join or LOJ if max1row output is assured
-        //
-        LogicNode oneSubqueryToJoin(LogicNode planWithSubExpr, SubqueryExpr subexpr)
+        // 
+        LogicNode oneSubqueryToJoin(LogicNode planWithSubExpr, SubqueryExpr subexpr, ref bool canRepalce)
         {
             LogicNode oldplan = planWithSubExpr;
             LogicNode newplan = null;
@@ -408,10 +547,13 @@ namespace qpmodel.logic
             switch (subexpr)
             {
                 case ExistSubqueryExpr se:
-                    newplan = existsToMarkJoin(planWithSubExpr, se);
+                    newplan = existsToMarkJoin(planWithSubExpr, se, ref canRepalce);
                     break;
                 case ScalarSubqueryExpr ss:
                     newplan = scalarToSingleJoin(planWithSubExpr, ss);
+                    break;
+                case InSubqueryExpr si:
+                    newplan = inToMarkJoin(planWithSubExpr, si);
                     break;
                 default:
                     break;
@@ -444,27 +586,27 @@ namespace qpmodel.logic
     //
     public class LogicMarkJoin : LogicJoin
     {
+        public int subquery_id_;
         public override string ToString() => $"{lchild_()} markX {rchild_()}";
-        public LogicMarkJoin(LogicNode l, LogicNode r) : base(l, r) { type_ = JoinType.Left; }
+        public LogicMarkJoin(LogicNode l, LogicNode r, int subquery_id) : base(l, r) { type_ = JoinType.Left; subquery_id_ = subquery_id; }
         public LogicMarkJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { type_ = JoinType.Left; }
 
         public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
         {
             var list = base.ResolveColumnOrdinal(reqOutput, removeRedundant);
-            output_.Insert(0, new MarkerExpr());
             return list;
         }
     }
     public class LogicMarkSemiJoin : LogicMarkJoin
     {
         public override string ToString() => $"{lchild_()} markSemiX {rchild_()}";
-        public LogicMarkSemiJoin(LogicNode l, LogicNode r) : base(l, r) { }
+        public LogicMarkSemiJoin(LogicNode l, LogicNode r, int subquery_id = 0) : base(l, r, subquery_id) { subquery_id_ = subquery_id; }
         public LogicMarkSemiJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { }
     }
     public class LogicMarkAntiSemiJoin : LogicMarkJoin
     {
         public override string ToString() => $"{lchild_()} markAntisemiX {rchild_()}";
-        public LogicMarkAntiSemiJoin(LogicNode l, LogicNode r) : base(l, r) { }
+        public LogicMarkAntiSemiJoin(LogicNode l, LogicNode r, int subquery_id = 0) : base(l, r, subquery_id) { }
         public LogicMarkAntiSemiJoin(LogicNode l, LogicNode r, Expr f) : base(l, r, f) { }
     }
 
@@ -476,43 +618,119 @@ namespace qpmodel.logic
         }
         public override string ToString() => $"PMarkJOIN({lchild_()},{rchild_()}: {Cost()})";
 
-        // always the first column
-        void fixMarkerValue(Row r, Value value) => r[0] = value;
+        // find the #marker from children output and located the #marker by subquery_id_.
+        void fixMarkerValue(Row r, Value value)
+        {
+            int ordinal = findMarkerOrdinal();
+            r[ordinal] = value;
+        }
+
+        int findMarkerOrdinal()
+        {
+            var output = this.logic_.output_;
+            int ordinal = output.FindIndex(x => x is ExprRef xE && xE.child_() is MarkerExpr xEM
+                            && logic_ is LogicMarkJoin lm && xEM.subqueryid_ == lm.subquery_id_);
+            return ordinal;
+        }
+
+        private bool filterHasMarkerBinExpr(Expr filter) => filter.FilterToAndList().Exists(x => x is BinExpr xB && xB.IsMarkerBinExpr());
 
         public override void Exec(Action<Row> callback)
+        {
+            var isDerivedFromInClause = filterHasMarkerBinExpr(logic_.filter_);
+            Exec(callback, isDerivedFromInClause);
+        }
+        public void Exec(Action<Row> callback, bool isDerivedFromInClause)
         {
             ExecContext context = context_;
             var logic = logic_ as LogicMarkJoin;
             var filter = logic.filter_;
             bool semi = (logic_ is LogicMarkSemiJoin);
             bool antisemi = (logic_ is LogicMarkAntiSemiJoin);
-
+            bool lIsNull = false; // l represent one row
+            bool RHasNull = false; // R represent a set of Row
+            bool RisEmpty = true;
+            Value marker = false; //false true null
+            int markerOrdinal = 0;
             Debug.Assert(filter != null);
 
             lchild_().Exec(l =>
             {
-                bool foundOneMatch = false;
+                lIsNull = l.ColsHasNull();
+                marker = false;
                 rchild_().Exec(r =>
                 {
-                    if (!foundOneMatch)
+                    Row n = new Row(l, r);
+                    if (isDerivedFromInClause)
                     {
-                        Row n = new Row(l, r);
-                        if (filter.Exec(context, n) is true)
+                        if (!(r is null))
+                            RHasNull = r.ColsHasNull();
+                        var andList = filter.FilterToAndList();
+
+                        // SELECT a1 FROM a WHERE a1 = 3 and a2 NOT IN (SELECT b2 FROM b WHERE a1 < b1);
+                        // a1 < b1 will not produce marker 
+                        // a2 = b2 will produce marker 
+                        // if the markjoin is derived from IN clause, we need to judge if it is a empty
+                        //
+                        if (andList.Count >= 2)
                         {
-                            foundOneMatch = true;
+                            var markerExpr = andList.Find(x => x is BinExpr xB && xB.IsMarkerBinExpr());
+                            andList.Remove(markerExpr);
+                            var excludeMarkerExpr = FilterHelper.AndListToExpr(andList);
+                            var flagE = excludeMarkerExpr.Exec(context, n);
+
+                            if (flagE is true)
+                                RisEmpty = false;
+                            else
+                                return;
 
                             // there is at least one match, mark true
+                            if (markerExpr.Exec(context, n) is true)
+                                marker = true;
+                        }
+                        else if (filter.Exec(context, n) is true)
+                            marker = true;
+                    }
+                    else if (!(marker is true) && !isDerivedFromInClause)
+                    {
+                        if (filter.Exec(context, n) is true)
+                        {
+                            marker = true;
                             n = ExecProject(n);
-                            fixMarkerValue(n, semi ? true : false);
+                            fixMarkerValue(n, semi);
                             callback(n);
                         }
                     }
                 });
 
-                // if there is no match, mark false
-                if (!foundOneMatch)
+                if (isDerivedFromInClause)
                 {
-                    Row n = ExecProject(l);
+                    if (marker is false && RHasNull)
+                        marker = null;
+
+                    if (lIsNull && RisEmpty)
+                        marker = false;
+
+                    Row r = new Row(rchild_().logic_.output_.Count);
+                    Row n = new Row(l, r);
+                    n = ExecProject(n);
+
+                    markerOrdinal = findMarkerOrdinal();
+                    if (marker is null)
+                        fixMarkerValue(n, false);
+                    else
+                    {
+                        bool boolMarker = marker is true ? true : false;
+                        fixMarkerValue(n, semi ? boolMarker : !boolMarker);
+                    }
+
+                    callback(n);
+                }
+                else if (!(marker is true) && !isDerivedFromInClause)
+                {
+                    Row r = new Row(rchild_().logic_.output_.Count);
+                    Row n = new Row(l, r);
+                    n = ExecProject(n);
                     fixMarkerValue(n, semi ? false : true);
                     callback(n);
                 }

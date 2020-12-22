@@ -29,11 +29,9 @@ using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
-using IronPython.Hosting;
 using System.Diagnostics;
 
 using qpmodel.codegen;
-using qpmodel.expr;
 using qpmodel.logic;
 using qpmodel.physic;
 using qpmodel.test;
@@ -168,7 +166,8 @@ namespace qpmodel
                         listoutput.Add(result.ToString());
                     }
 
-                } catch (Exception e)
+                }
+                catch (Exception e)
                 {
                     Console.WriteLine("SQL: " + sql + "\nEXCEPTION: " + e + "\n");
                     continue;
@@ -266,10 +265,10 @@ namespace qpmodel
                 // query options might be conflicting or incomplete
                 Console.WriteLine(sql);
                 var a = RawParser.ParseSingleSqlStatement(sql);
-                ExplainOption.show_tablename_ = false;
+                ExplainOption.show_tablename_ = true;
                 a.queryOpt_.profile_.enabled_ = true;
                 a.queryOpt_.optimize_.enable_subquery_unnest_ = true;
-                a.queryOpt_.optimize_.remove_from_ = false;
+                a.queryOpt_.optimize_.remove_from_ = true;
                 a.queryOpt_.optimize_.use_memo_ = true;
                 a.queryOpt_.optimize_.enable_cte_plan_ = true;
                 a.queryOpt_.optimize_.use_codegen_ = false;

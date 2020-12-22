@@ -28,13 +28,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using System.Diagnostics;
 
 using qpmodel.expr;
 using qpmodel.physic;
 using qpmodel.utils;
+using qpmodel.stream;
 
 namespace qpmodel.logic
 {
@@ -50,7 +49,7 @@ namespace qpmodel.logic
         {
             // rewrite controls
             public bool enable_subquery_unnest_ { get; set; } = true;
-            public bool remove_from_ { get; set; } = false;        // make it true by default
+            public bool remove_from_ { get; set; } = true;
             public bool enable_cte_plan_ { get; set; } = false; // make it true by default
 
             // optimizer controls
@@ -74,6 +73,7 @@ namespace qpmodel.logic
             {
                 enable_subquery_unnest_ = true;
                 remove_from_ = true;
+                enable_cte_plan_ = true;
 
                 enable_hashjoin_ = true;
                 enable_nljoin_ = true;
@@ -285,9 +285,13 @@ namespace qpmodel.logic
                     if (queryOpt_.optimize_.enable_subquery_unnest_)
                     {
                         // use the plan 'root' containing the subexpr 'x'
-                        var replacement = oneSubqueryToJoin(root, x);
+                        bool canReplaceRoot = false;
+                        var replacement = oneSubqueryToJoin(root, x, ref canReplaceRoot);
                         newroot = (LogicNode)newroot.SearchAndReplace(root,
                                                                 replacement);
+                        // consider  mark@1 or @2 , @2 is not unnested yet, 
+                        // so it can't be push down i.e. it keep as a root
+                        if (canReplaceRoot) root = newroot;
                     }
                 }
                 else if (e is FuncExpr f && f.isSRF_)
@@ -330,7 +334,10 @@ namespace qpmodel.logic
                 switch (tab)
                 {
                     case BaseTableRef bref:
-                        from = new LogicScanTable(bref);
+                        if (bref.Table().source_ == TableDef.TableSource.Table)
+                            from = new LogicScanTable(bref);
+                        else
+                            from = new LogicScanStream(bref);
                         if (bref.tableSample_ != null)
                             from = new LogicSampleScan(from, bref.tableSample_);
                         break;
@@ -419,19 +426,7 @@ namespace qpmodel.logic
             //
             bool hasdtable = false;
             bool onlyreplicated = true;
-            from_.ForEach(x =>
-            {
-                if (x is BaseTableRef bx)
-                {
-                    var method = bx.Table().distMethod_;
-                    if (bx.IsDistributed())
-                    {
-                        hasdtable = true;
-                        if (method != TableDef.DistributionMethod.Replicated)
-                            onlyreplicated = false;
-                    }
-                }
-            });
+            from_.ForEach(x => checkifHasdtableAndifOnlyReplicated(x, ref hasdtable, ref onlyreplicated));
             if (hasdtable)
             {
                 Debug.Assert(!distributed_);
@@ -448,6 +443,37 @@ namespace qpmodel.logic
             }
 
             return root;
+        }
+
+        // consider select from( select from ( select ...) ...)...
+        // here we use recursion
+        void checkifHasdtableAndifOnlyReplicated(TableRef x, ref bool hasdtable, ref bool onlyreplicated)
+        {
+            if (x is BaseTableRef bx)
+            {
+                var method = bx.Table().distMethod_;
+                if (bx.IsDistributed())
+                {
+                    hasdtable = true;
+                    if (method != TableDef.DistributionMethod.Replicated)
+                        onlyreplicated = false;
+                }
+            }
+            else if (x is QueryRef qx)
+            {
+                var t_hasdtable = hasdtable;
+                var t_onlyreplicated = onlyreplicated;
+                if (qx.query_ != null)
+                {
+                    if (qx.query_.from_ != null)
+                    {
+                        var from = qx.query_.from_;
+                        from.ForEach(x => checkifHasdtableAndifOnlyReplicated(x, ref t_hasdtable, ref t_onlyreplicated));
+                        hasdtable = t_hasdtable;
+                        onlyreplicated = t_onlyreplicated;
+                    }
+                }
+            }
         }
 
         // select * from (select max(b3) maxb3 from b) b where maxb3>1
@@ -530,7 +556,20 @@ namespace qpmodel.logic
                     root = new LogicFilter(root, where_);
                 else
                     lr.filter_ = lr.filter_.AddAndFilter(where_);
-                if (where_.HasAggFunc())
+
+                // Do this only if the filter refernces single table, otherwise
+                // let FilterPushdown decide if the filter can be moved into aggregate
+                // node or a join above it.
+                // The query
+                // select a1 from a, (select max(b3) maxb3 from b) b where a1 < maxb3
+                // generates bad plan
+                // LogicJoin 1063
+                //      -> LogicScanTable 1064 a
+                //      -> LogicAgg 1066
+                //
+                //         Filter: a.a1[0]<max(b.b3[2])
+                //      -> LogicScanTable 1065 b
+                if (where_.HasAggFunc() && where_.CollectAllTableRef().Count < 2)
                 {
                     where_ = moveFilterToInsideAggNode(root, where_);
                     root = new LogicFilter(root.child_(), where_);
@@ -603,7 +642,12 @@ namespace qpmodel.logic
             else
             {
                 // FIXME: we can't enable all optimizations with this mode
-                queryOpt_.optimize_.remove_from_ = false;
+                // Actually, we can't set remove_from to true unconditionally.
+                // It is true by default, but for certain queries it must be turned off,
+                // therefore we should take it from the user specified options, if it is
+                // supplied (queryOpt_ != null). TestBenchmarks and a few other
+                // tests set it to false to run correctly.
+                // Leaving use_memo_ alone, though.
                 queryOpt_.optimize_.use_memo_ = false;
 
                 setops_.Bind(parent);
@@ -675,6 +719,111 @@ namespace qpmodel.logic
             return newselection;
         }
 
+        internal bool IsAggregateInFrom()
+        {
+            int foundCount = 0;
+            from_.ForEach(x =>
+            {
+                if (x is FromQueryRef fqr && foundCount == 0)
+                {
+                    groupby_.ForEach(y =>
+                    {
+                        if (foundCount == 0 && fqr.FindInsideExpr(y))
+                            ++foundCount;
+                    });
+                }
+            });
+
+            return foundCount != 0;
+        }
+
+        // A subquery can contain an aggregate in selections, where, group by
+        // and having, if all column references contained in in are outer
+        // references.
+        // From IWD 9075-2:201?(E), draft standard, 2011-12-21
+        // Section 7.8 WHERE. Syntax rule (SR) 1: WHERE
+        // Section 7.10 HAVING. SR 3
+        // 10.9.6 Conformance rules. section 77
+        // 1) If a <value expression> directly contained in the <search condition>
+        // is a <set function specification>, then the <where clause> shall be
+        // contained in a <having clause> or <select list>, the <set function specification>
+        // shall contain a column reference, and every column reference contained in
+        // an aggregated argument of the <set function specification> shall
+        // be an outer reference.
+        // Qpmodel extends this by allowing more than one outer references as arguments
+        // aggregates in this context.
+
+        internal bool hasInvalidAggregateInClause(Expr expr)
+        {
+            bool isSelectionExpr(SelectStmt par, SelectStmt e)
+            {
+                bool ans = false;
+                par.selection_.ForEach(x =>
+                {
+                    if (x is SubqueryExpr sqe && sqe.query_ == e)
+                        ans = true;
+                });
+
+                return ans;
+            }
+
+            bool isHavingExpr(Expr hav, SelectStmt e)
+            {
+                bool ans = false;
+                if (hav == null)
+                    return ans;
+
+                List<Expr> lexpr = hav.RetrieveAllType<Expr>();
+                lexpr.ForEach(x =>
+                {
+                    if (x is SubqueryExpr sqe && sqe.query_ == e)
+                        ans = true;
+                });
+
+                return ans;
+            }
+
+            int invCount = 0;
+            SelectStmt par = parent_, self = this;
+            List<AggFunc> aggfncs = expr.RetrieveAllType<AggFunc>();
+            if (aggfncs.Count > 0)
+            {
+                while (par != null && invCount == 0)
+                {
+                    // Is this statement not part of parent's select, or having?
+                    if (isSelectionExpr(par, self) || isHavingExpr(par.having_, self))
+                    {
+                        aggfncs.ForEach(a =>
+                        {
+                            if (a.RetrieveAllColExpr().Count > 0)
+                                ++invCount;
+                        });
+                    }
+                    else
+                    {
+                        ++invCount;
+                    }
+
+                    if (invCount == 0)
+                        par = par.parent_;
+                }
+            }
+
+            return invCount != 0;
+        }
+
+        internal bool hasInvalidAggregateInClause(List<Expr> lexpr)
+        {
+            int invalidCount = 0;
+            lexpr.ForEach(x =>
+            {
+                if (hasInvalidAggregateInClause(x))
+                    ++invalidCount;
+            });
+
+            return invalidCount != 0;
+        }
+
         internal void BindWithContext(BindContext context)
         {
             // we don't consider setops in this level
@@ -696,7 +845,7 @@ namespace qpmodel.logic
             {
                 where_ = where_.BindAndNormalizeClause(context);
                 where_ = where_.FilterNormalize();
-                if (!where_.IsBoolean() || where_.HasAggFunc())
+                if (!where_.IsBoolean() || hasInvalidAggregateInClause(where_))
                     throw new SemanticAnalyzeException(
                         "WHERE condition must be a boolean expression and no aggregation is allowed");
                 if (queryOpt_.optimize_.remove_from_)
@@ -708,7 +857,13 @@ namespace qpmodel.logic
                 hasAgg_ = true;
                 groupby_ = bindOrderByOrGroupBy(context, groupby_);
                 if (groupby_.Any(x => x.HasAggFunc()))
-                    throw new SemanticAnalyzeException("aggregation functions are not allowed in group by clause");
+                {
+                    // remove_from optimization can produce aggregates in
+                    // group by, detect it and suppress this throw if that
+                    // is the case.
+                    if (!IsAggregateInFrom() && hasInvalidAggregateInClause(groupby_))
+                        throw new SemanticAnalyzeException("aggregation functions are not allowed in group by clause");
+                }
             }
 
             if (having_ != null)
@@ -752,7 +907,17 @@ namespace qpmodel.logic
                     break;
                 case JoinQueryRef jref:
                     jref.tables_.ForEach(x => bindTableRef(context, x));
-                    jref.constraints_.ForEach(x => x = x.BindAndNormalize(context));
+                    jref.constraints_.ForEach(x =>
+                    {
+                        x = x.BindAndNormalize(context);
+                        // join constraints may contain FROM(x) when
+                        // remove_from is true. If FROM(x) is not DeQueryRef'd
+                        // the join  condition may not get pushed down to the proper
+                        // node and also possibly can't be resolved.
+                        if (queryOpt_.optimize_.remove_from_)
+                            x = x.DeQueryRef();
+                    });
+
                     break;
                 default:
                     throw new NotImplementedException();

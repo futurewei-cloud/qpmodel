@@ -67,6 +67,13 @@ Regular Community Meeting:
 Zoom: https://futurewei.zoom.us/j/97155138938
 2) Tuesday, Sept 29, 2020 7:00 PM-8:30 PM (UTC-08:00) Pacific Time (US & Canada).
 Zoom: https://futurewei.zoom.us/j/8320379082
+3) Wednesday, Oct 28, 2020 07:00 PM-8:30 PM (UTC-08:00) Pacific Time (US and Canada)
+Zoom: https://futurewei.zoom.us/j/8320379082
+4) Tuesday, Nov 24, 2020 06:00 PM-7:30 PM (UTC-08:00) Pacific Time (US and Canada)
+Zoom: https://futurewei.zoom.us/j/8320379082
+
+Meeting minutes: 
+https://github.com/zhouqingqing/qpmodel/tree/master/docs/qpmodel_m*.pptx
 
 Link for Videos:
 https://www.youtube.com/playlist?list=PL_7gYB_Le9d2OFbt67OgQPSynRIWvTtU6

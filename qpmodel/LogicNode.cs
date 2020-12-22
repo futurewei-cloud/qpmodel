@@ -35,6 +35,7 @@ using qpmodel.physic;
 using qpmodel.index;
 using qpmodel.optimizer;
 using qpmodel.utils;
+using qpmodel.stream;
 
 using LogicSignature = System.Int64;
 using BitVector = System.Int64;
@@ -67,6 +68,11 @@ namespace qpmodel.logic
 
         // it is possible to really have this value but ok to recompute
         protected LogicSignature logicSign_ = -1;
+
+        public List<TableRef> GetTableRef()
+        {
+            return tableRefs_;
+        }
 
         public override string ExplainMoreDetails(int depth, ExplainOption option) => ExplainFilter(filter_, depth, option);
 
@@ -133,18 +139,23 @@ namespace qpmodel.logic
             switch (this)
             {
                 case LogicScanTable ln:
-                    // if there are indexes can help filter, use them
-                    IndexDef index = null;
-                    if (ln.filter_ != null)
-                    {
-                        if (option.optimize_.enable_indexseek_)
-                            index = ln.filter_.FilterCanUseIndex(ln.tabref_);
-                        ln.filter_.SubqueryDirectToPhysic();
-                    }
-                    if (index is null)
-                        result = new PhysicScanTable(ln);
+                    if (ln is LogicScanStream)
+                        result = new PhysicScanStream(ln);
                     else
-                        result = new PhysicIndexSeek(ln, index);
+                    {
+                        // if there are indexes can help filter, use them
+                        IndexDef index = null;
+                        if (ln.filter_ != null)
+                        {
+                            if (option.optimize_.enable_indexseek_)
+                                index = ln.filter_.FilterCanUseIndex(ln.tabref_);
+                            ln.filter_.SubqueryDirectToPhysic();
+                        }
+                        if (index is null)
+                            result = new PhysicScanTable(ln);
+                        else
+                            result = new PhysicIndexSeek(ln, index);
+                    }
                     break;
                 case LogicJoin lc:
                     var phyleft = phyfirst;
@@ -262,7 +273,7 @@ namespace qpmodel.logic
             return tableRefs_;
         }
 
-        internal Expr CloneFixColumnOrdinal(Expr toclone, List<Expr> source, bool idonly = false)
+        internal Expr CloneFixColumnOrdinal(Expr toclone, List<Expr> source, List<Expr> output = null, bool idonly = false)
         {
             Debug.Assert(toclone.bounded_);
             Debug.Assert(toclone._ != null);
@@ -271,7 +282,7 @@ namespace qpmodel.logic
             // first try to match the whole expression - don't do this for ColExpr
             // because it has no practial benefits.
             // 
-            if (!(clone is ColExpr))
+            if (!(clone is ColExpr) && !(clone is MarkerExpr))
             {
                 int ordinal = source.FindIndex(clone.Equals);
                 // for derived child node, compare only the expression id
@@ -282,6 +293,44 @@ namespace qpmodel.logic
                     return new ExprRef(clone, ordinal);
             }
 
+            // the marker's ordinal should equal to a2, i.e. the frontest index in disapeard colExpr
+            // a1 a2 b2 
+            // a1 marker (a2,b2 disapeared )
+            if (clone is MarkerExpr)
+            {
+                var findExpr = source.Find(x => x._ == clone._);
+                var findIndex = source.FindIndex(x => x._ == clone._);
+                if (findExpr is ExprRef)
+                {
+                    return new ExprRef(clone, findIndex);
+                }
+                else
+                {
+                    Debug.Assert(this is LogicMarkJoin);
+                    int markerOrdinal = source.FindIndex(x => output.Find(y => y._ == x._) == null);
+                    Debug.Assert(markerOrdinal != -1);
+                    // MarkJoin will project out some columns 
+                    // so we set the markExpr's ordinal to smallest of those deleted colExprs
+                    return new ExprRef(clone, markerOrdinal);
+                }
+            }
+
+            // the LogicOrExpr with Marker should be consider
+            //input  (mark@1 or mark@2) or mark@3
+            if (clone is LogicAndOrExpr)
+            {
+                clone.VisitEach(x =>
+                {
+                    if (x is ExprRef xE && xE.child_() is MarkerExpr xEM) // find #marker
+                    {
+                        int t_ordinal = source.FindIndex(xS =>
+                              //find the #marker by subqueryid_ in children's output
+                              xS is ExprRef xSE && xSE.child_() is MarkerExpr xSEM ? xEM.subqueryid_ == xSEM.subqueryid_ : false);
+                        Debug.Assert(t_ordinal > 0); // there must be a marker produced by child
+                        clone = clone.SearchAndReplace<ExprRef>(xE, new ExprRef(xEM, t_ordinal));
+                    }
+                });
+            }
             /*
              * We need to resolve the aggregates here or the next loop will descend into aggregates
              * and try to resolve the column arguments and they may not be found in all cases.
@@ -380,7 +429,8 @@ namespace qpmodel.logic
                     idonly = true;
             });
 
-            toclone.ForEach(x => clone.Add(CloneFixColumnOrdinal(x, source, idonly)));
+            List<Expr> output = new List<Expr>(toclone);
+            toclone.ForEach(x => clone.Add(CloneFixColumnOrdinal(x, source, output, idonly)));
             Debug.Assert(clone.Count == toclone.Count);
 
             if (removeRedundant)
@@ -406,9 +456,12 @@ namespace qpmodel.logic
         public virtual List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
         {
             List<int> ordinals = new List<int>();
-
-            children_[0].ResolveColumnOrdinal(reqOutput, removeRedundant);
-            output_ = children_[0].output_;
+            List<Expr> reqFromChild = new List<Expr>();
+            reqFromChild.AddRange(reqOutput.CloneList());
+            reqFromChild.RemoveAll(x => x is SubqueryExpr);
+            children_[0].ResolveColumnOrdinal(reqFromChild);
+            var childout = new List<Expr>(child_().output_);
+            output_ = CloneFixColumnOrdinal(reqOutput, childout, removeRedundant);
             RefreshOutputRegisteration();
             return ordinals;
         }
@@ -642,6 +695,8 @@ namespace qpmodel.logic
             }
         }
 
+        public bool isSubSet(List<TableRef> small, List<TableRef> big) => small.All(t => big.Any(b => b == t)) ? true : false;
+
         public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
         {
             // request from child including reqOutput and filter
@@ -655,31 +710,122 @@ namespace qpmodel.logic
             var rtables = rchild_().InclusiveTableRefs();
             var lreq = new HashSet<Expr>();
             var rreq = new HashSet<Expr>();
+            // seperate the output to related child respectively
+            Debug.Assert((this.lchild_() != null) && (this.rchild_() != null));
+            if (this is LogicMarkJoin LMJ)
+            {
+                var lchild = this.lchild_();
+                var rchild = this.rchild_();
+                List<Expr> reqFromChildRemove = new List<Expr>();
+                // consider (marker@1 or marker@2)
+                // a markjoin@1 b markjoin@2 c
+                //  
+                //  (marker@1,marker@2)   |><|@1
+                //                       /    \
+                //  (marker@2)        |><|@2    a
+                //                     /    \
+                //                   b       c
+                //
+                // if this is the markjoin@1, the marker@1 is produce by this MarkJoin
+                // we should keep marker@1, meanwhile, delete it in reqFromChild
+                // and should figure out which side has produced marker@2
+                // infact, we always use LeftMarkJoin, so the marker@2 may always drop into left.
+                // so the rchild check may be unnecessary
+                lchild.VisitEach(x =>
+                {
+                    if (x is LogicMarkJoin)
+                    {
+                        foreach (var v in reqFromChild)
+                        {
+                            if (v is MarkerExpr vM)
+                            {
+                                var xTableRef = x.GetTableRef();
+                                if (isSubSet(vM.tableRefs_, xTableRef) && !(LMJ.subquery_id_ == vM.subqueryid_))
+                                {
+                                    lreq.Add(v);
+                                    reqFromChildRemove.Add(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                );
+                rchild.VisitEach(x =>
+                {
+                    if (x is LogicMarkJoin)
+                    {
+                        foreach (var v in reqFromChild)
+                        {
+                            if (v is MarkerExpr vM)
+                            {
+                                var xTableRef = x.GetTableRef();
+                                if (isSubSet(v.tableRefs_, xTableRef) && !(LMJ.subquery_id_ == vM.subqueryid_))
+                                {
+                                    rreq.Add(v);
+                                    reqFromChildRemove.Add(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                );
+                reqFromChildRemove.ForEach(x =>
+                {
+                    reqFromChild.Remove(x);
+                });
+            }
+            Expr thisReq = null; // markjoin will produce a Marker Expr
             foreach (var v in reqFromChild)
             {
-                var tables = v.CollectAllTableRef();
-
-                if (ltables.ContainsList(tables))
-                    lreq.Add(v);
-                else if (rtables.ContainsList(tables))
-                    rreq.Add(v);
-                else
+                if (!(v is MarkerExpr vM) || !(this is LogicMarkJoin lmj))
                 {
-                    // the whole list can't push to the children (Eg. a.a1 + b.b1)
-                    // decompose to singleton and push down
-                    var colref = v.RetrieveAllColExpr();
-                    colref.ForEach(x =>
+                    var tables = v.CollectAllTableRef();
+                    if (ltables.ContainsList(tables))
+                        lreq.Add(v);
+                    else if (rtables.ContainsList(tables))
+                        rreq.Add(v);
+                    else
                     {
-                        if (ltables.Contains(x.tableRefs_[0]))
-                            lreq.Add(x);
-                        else if (rtables.Contains(x.tableRefs_[0]))
-                            rreq.Add(x);
-                        else
-                            throw new InvalidProgramException($"requests contains invalid tableref {x.tableRefs_[0]}");
+                        // the whole list can't push to the children (Eg. a.a1 + b.b1)
+                        // decompose to singleton and push down
+                        var colref = v.RetrieveAllColExpr();
+                        colref.ForEach(x =>
+                        {
+                            if (ltables.Contains(x.tableRefs_[0]))
+                                lreq.Add(x);
+                            else if (rtables.Contains(x.tableRefs_[0]))
+                                rreq.Add(x);
+                            else
+                                throw new InvalidProgramException($"requests contains invalid tableref {x.tableRefs_[0]}");
+                        });
+                    }
+
+                    // Let the count(*) be counted!
+                    // When remove_from is removed a query like
+                    // select b1+c100 from (select count(*) as b1 from b) a, (select c1 c100 from c) c where c100>1
+                    // count(*) does down to b as required output which is not valid.
+                    // The fix is to require (0) from the child referenced by the count(*) here
+                    // and include count(*) tablRefs in CollectAllTableRef().
+                    var agcs = v.RetrieveAllType<AggCountStar>();
+                    agcs.ForEach(y =>
+                    {
+                        y.tableRefs_.ForEach(z =>
+                        {
+                            if (ltables.Contains(z))
+                                lreq.Add(y);
+                            else if (rtables.Contains(z))
+                                rreq.Add(y);
+                            else
+                                throw new InvalidProgramException($"requests contains invalid tableref {z.alias_}");
+                        });
                     });
                 }
+                else
+                {
+                    if (lmj.subquery_id_ == vM.subqueryid_)
+                        thisReq = v;// the lefted markjoin is requested by this
+                }
             }
-
             // get left and right child to resolve columns
             lchild_().ResolveColumnOrdinal(lreq.ToList());
             var lout = lchild_().output_;
@@ -691,6 +837,11 @@ namespace qpmodel.logic
             var childrenout = lout.ToList(); childrenout.AddRange(rout.ToList());
             if (filter_ != null)
                 filter_ = CloneFixColumnOrdinal(filter_, childrenout);
+            if (this is LogicMarkJoin)
+            {
+                Debug.Assert(thisReq != null);// there must be a markExpr produce by this LogicMarkJoin
+                childrenout.Add(thisReq);
+            }
             output_ = CloneFixColumnOrdinal(reqOutput, childrenout, removeRedundant);
 
             RefreshOutputRegisteration();
@@ -727,7 +878,7 @@ namespace qpmodel.logic
             {
                 if (!(expr is AggFunc))
                 {
-                    if (expr is ColExpr ec && !ec.isParameter_)
+                    if ((expr is ColExpr ec && !ec.isParameter_) || expr is MarkerExpr)
                         list.Add(expr);
                     foreach (var v in expr.children_)
                         addColumnAndAggFuncs(v, list);
@@ -785,7 +936,7 @@ namespace qpmodel.logic
         public override LogicSignature MemoLogicSign()
         {
             if (logicSign_ == -1)
-                logicSign_ = (child_().MemoLogicSign() << 32) + ((isLocal_.GetHashCode() ^ 
+                logicSign_ = (child_().MemoLogicSign() << 32) + ((isLocal_.GetHashCode() ^
                     having_.FilterHashCode() ^ rawAggrs_.ListHashCode() ^ groupby_.ListHashCode()) >> 32);
             return logicSign_;
         }
@@ -905,13 +1056,13 @@ namespace qpmodel.logic
 
                 // add back the dependent exprs back
                 x.VisitEachIgnoreRef<AggFunc>(y =>
+            {
+                foreach (var z in y.GetNonFuncExprList())
                 {
-                    foreach (var z in y.GetNonFuncExprList())
-                    {
-                        if (!exprConsistPureKeys(y, keys) && !z.HasAggrRef())
-                            reqList.Add(z);
-                    }
-                });
+                    if (!exprConsistPureKeys(y, keys) && !z.HasAggrRef())
+                        reqList.Add(z);
+                }
+            });
             });
 
             reqList = reqList.Distinct().ToList();
@@ -1024,13 +1175,71 @@ namespace qpmodel.logic
 
             // reqOutput may contain ExprRef which is generated during FromQuery removal process, remove them
             var reqList = processedOutput.CloneList(new List<Type> { typeof(ConstExpr) });
+            // Aggregates in group by handling. If there are aggregates in
+            // group by, collect their arguments (directly contained aggregate
+            // functions and those inside AggrRef and other expressions and
+            // make this list as required from child. Save the original
+            // group by and null it out.
+            // After getting the output from the child, restore the original
+            // group by and resolve everthing as usual.
+            List<Expr> newGrpBy = null;
+            List<Expr> savedGrpBy = null;
+
+            if (groupby_ != null)
+            {
+                bool hasAgg = false;
+                groupby_.ForEach(x =>
+                {
+                    if (x.HasAggFunc())
+                        hasAgg = true;
+                });
+
+                if (hasAgg)
+                {
+                    newGrpBy = new List<Expr>();
+                    savedGrpBy = groupby_.CloneList();
+                    for (int i = 0; i < groupby_.Count; ++i)
+                    {
+                        Expr x = groupby_[i];
+                        if (x is AggFunc agf)
+                            newGrpBy.Add(x);
+                        else if (x is AggrRef agr)
+                            newGrpBy.Add(agr.child_());
+                        else
+                            newGrpBy.Add(x);
+                    }
+                }
+            }
+
+            if (newGrpBy != null)
+                groupby_ = null;
 
             // request from child including reqOutput and filter. Don't use whole expression
             // matching push down like k+k => (k+k)[0] instead, we need k[0]+k[0] because 
             // aggregation only projection values from hash table(key, value).
             //
             List<Expr> reqFromChild = new List<Expr>();
-            reqFromChild.AddRange(removeAggFuncAndKeyExprsFromOutput(reqList, groupby_));
+            if (newGrpBy != null)
+                reqFromChild.AddRange(newGrpBy);
+            else
+                reqFromChild.AddRange(removeAggFuncAndKeyExprsFromOutput(reqList, groupby_));
+
+            // Issue exposed by removing remove_from.
+            // Remeber the last position of output required by the parent, it is not an error
+            // if the offending occures after this position.
+            // The query that fails is
+            // select d1, sum(d2) from (select c1/2, sum(c1) from (select b1, count(*) as a1 from b group by b1)c(c1, c2)
+            // group by c1/2) d(d1, d2) group by d1;
+            // LogicPlan will be Agg(Agg(Agg(b)))
+            // While resolving second level Agg, group by is b1 / 2, reqOutput is b1/2, sum(b1), b1
+            // after removeAggFuncAndKeyExprsFromOutput, the list is b1/2, b1
+            // after adding group by expressions/columns it is b1 / 2, b1, b1
+            // child output is b1/2, b1
+            // after new aggregates are generated, our output is b1/2 {expref}, sum(b1) {expref}, b1 {colref} added by us
+            // will not be changed into ExprRef because it is not grouping expression. This sets the offending and
+            // raises the error column x must appear in group by clause.
+            //
+            int grpbyColumnAddPosition = reqFromChild.Count;
 
             // It is ideal to add keys_ directly to reqFromChild but matching can be harder.
             // Consider the following case:
@@ -1055,6 +1264,8 @@ namespace qpmodel.logic
             child_().ResolveColumnOrdinal(reqFromChild);
             var childout = child_().output_;
 
+            if (savedGrpBy != null)
+                groupby_ = savedGrpBy;
             if (groupby_ != null)
                 groupby_ = CloneFixColumnOrdinal(groupby_, childout, true);
             if (having_ != null)
@@ -1066,14 +1277,27 @@ namespace qpmodel.logic
 
             // Say invvalid expression means contains colexpr (replaced with ref), then the output shall
             // contains no expression consists invalid expression
+            // TODO: This check on offending, and offendingFirstPos are not as good as they
+            // should be and therefore some queries will fail to compile or run if remove_from
+            // is enabled. This needs to be refined to cover all invalid cases but none that are
+            // valid, i.e, don't throw when remove_from is enabled and it looks like there are
+            // column references in the group by that are not in group by, aggregates in select list.
+            // The reference query:
+            // select d1, sum(d2) from (select c1/2, sum(c1) from (select b1, count(*) as a1 from b group by b1)c(c1, c2) group by c1/2) d(d1, d2) group by d1;
             //
+            int offendingFirstPos = -1, offendingPos = 0;
             Expr offending = null;
             newoutput.ForEach(x =>
             {
                 if (x.VisitEachExists(y => y is ColExpr, new List<Type> { typeof(ExprRef) }))
+                {
                     offending = x;
+                    if (offendingFirstPos == -1)
+                        offendingFirstPos = offendingPos;
+                }
+                ++offendingPos;
             });
-            if (offending != null)
+            if (offending != null && offendingFirstPos < grpbyColumnAddPosition)
                 throw new SemanticAnalyzeException($"column {offending} must appear in group by clause");
             output_ = newoutput;
             if (having_?.VisitEachExists(y => y is ColExpr, new List<Type> { typeof(ExprRef) }) ?? false)
@@ -1117,8 +1341,11 @@ namespace qpmodel.logic
             // in the GROUP BY clause.
             //
             reqFromChild.AddRange(orders_);
+
+            reqFromChild.RemoveAll(x => x is SubqueryExpr);
+
             child_().ResolveColumnOrdinal(reqFromChild);
-            var childout = child_().output_;
+            var childout = new List<Expr>(child_().output_);
 
             orders_ = CloneFixColumnOrdinal(orders_, childout, false);
             output_ = CloneFixColumnOrdinal(reqOutput, childout, removeRedundant);
@@ -1220,6 +1447,7 @@ namespace qpmodel.logic
                     {
                         case ConstExpr ly:    // select 2+3, ...
                         case SubqueryExpr sy:   // select ..., sx = (select b1 from b limit 1) from a;
+                        case MarkerExpr my: // markjoin
                             break;
                         default:
                             // aggfunc shall never pushed to me
@@ -1233,7 +1461,6 @@ namespace qpmodel.logic
                 });
             });
         }
-
         public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
         {
             List<int> ordinals = new List<int>();
@@ -1294,14 +1521,81 @@ namespace qpmodel.logic
         public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true) => null;
     }
 
+    // LogicAppend needs extra information to allow remove_from optimization to work
+    // correctly on UNION queries inside a FromQuery.
+    // Resolve all selects in UNION. When remove_from is true, we don't
+    // generate a setop plan and therefore all except the first select remain
+    // without ordinals resolved. This leads to their output being null at
+    // execution time and the result is null pointer exception.
+    // The way to handle the situation is to let each LogicAppend node to know
+    // the SetOp tree it is part of. This is done by passing the SetOp tree
+    // whose left and right selects correspond to the left and right nodes of this
+    // logicAppend node in the constructor.
+    // Visit each branch of the SetOp tree and locate the select which corrresponds to
+    // left and right node and record those select lists as leftExprs_ and rightExprs_.
+    //
+    // Override ResolveColumnOrdinal in LogicAppend and using the saved
+    // selections, resolve the minimum of selections or reqOutput from each child.
+    //
+    // Set the top level LogicAppend's outputs to those of the first child.
+    //
     public class LogicAppend : LogicNode
     {
+        public List<Expr> leftExprs_;     // left plan's selection
+        public List<Expr> rightExprs_;    // right plan's selection
         public override string ToString() => $"Append({lchild_()},{rchild_()})";
 
-        public LogicAppend(LogicNode l, LogicNode r) { children_.Add(l); children_.Add(r); }
+        public LogicAppend(LogicNode l, LogicNode r, SetOpTree setops = null)
+        {
+            children_.Add(l);
+            children_.Add(r);
 
-        // LogicAppend only needs to resolve column ordinals of its first child because others
-        // already solved in ResolveOrdinals().
+            // Using the setop tree, find the left and right plan's
+            // selections and save them to be used in ordinal resolution of
+            // all selects when this is not a top level UNION and remove_from
+            // is true.
+            if (setops != null)
+            {
+                setops.VisitEachStatement(x =>
+                {
+                    if (x.logicPlan_ == lchild_())
+                        leftExprs_ = x.selection_;
+                    else if (x.logicPlan_ == rchild_())
+                        rightExprs_ = x.selection_;
+                });
+            }
+        }
+
+        // Resolve one child's ordinals
+        internal void ResolveChild(in LogicNode child, in List<Expr> childExprs, in List<Expr> reqOutput, bool removeRedundant)
+        {
+            int minReq = Math.Min(reqOutput.Count, childExprs.Count);
+            List<Expr> childReq = new List<Expr>();
+            for (int i = 0; i < minReq; ++i)
+                childReq.Add(rightExprs_[i]);
+            child.ResolveColumnOrdinal(childReq, removeRedundant);
+        }
+
+        public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
+        {
+            List<int> ordinals = children_[0].ResolveColumnOrdinal(reqOutput, removeRedundant);
+
+            if (rightExprs_ != null && children_[1].output_.Count == 0)
+                ResolveChild(children_[1], rightExprs_, reqOutput, removeRedundant);
+
+            if (leftExprs_ != null && children_[0].output_.Count == 0)
+                ResolveChild(children_[0], leftExprs_, reqOutput, removeRedundant);
+
+            // Only the top level LogicAppend will have the output_ still unset,
+            // set it after all children has their output set.
+            if (output_.Count == 0)
+            {
+                List<Expr> childout = children_[0].output_;
+                output_ = CloneFixColumnOrdinal(reqOutput, childout, removeRedundant);
+            }
+
+            return ordinals;
+        }
     }
 
     public class LogicLimit : LogicNode
@@ -1325,8 +1619,17 @@ namespace qpmodel.logic
 
         public override List<int> ResolveColumnOrdinal(in List<Expr> reqOutput, bool removeRedundant = true)
         {
+
+            List<int> ordinals = new List<int>();
+            List<Expr> reqFromChild = new List<Expr>();
+            reqFromChild.AddRange(reqOutput.CloneList());
+            reqFromChild.RemoveAll(x => x is SubqueryExpr);
+            children_[0].ResolveColumnOrdinal(reqFromChild);
+            var childout = new List<Expr>(child_().output_);
             // limit is the top node and don't remove redundant
-            return base.ResolveColumnOrdinal(reqOutput, false);
+            output_ = CloneFixColumnOrdinal(reqOutput, childout, removeRedundant);
+            RefreshOutputRegisteration();
+            return ordinals;
         }
     }
 
